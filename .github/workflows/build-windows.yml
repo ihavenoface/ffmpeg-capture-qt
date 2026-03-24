@@ -1,54 +1,43 @@
-name: build-windows-release
+name: Build & Pre-Release
 
 on:
   push:
-    branches:
-      - main
-      - master
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    branches: ["**"]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t my-qt6-win -f Dockerfile .
-
-      - name: Prepare writable home for Wine
-        run: mkdir -p "$GITHUB_WORKSPACE/.ci-home"
-
-      - name: Build Windows app
+      - name: Build (cross-compile Windows via Docker)
         run: |
           docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp/home \
-            -e WINEPREFIX=/tmp/home/.wine \
-            -v "$GITHUB_WORKSPACE:/home/user/project" \
-            -v "$GITHUB_WORKSPACE/.ci-home:/tmp/home" \
-            my-qt6-win
+            -v "${{ github.workspace }}:/home/user/project" \
+            stateoftheartio/qt6:6.6-mingw-aqt
 
-      - name: Create release metadata
-        id: meta
+      - name: Rename artifact with commit SHA
         run: |
-          TAG="pre-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
-          NAME="Windows prerelease ${GITHUB_RUN_NUMBER}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          SHORT="${GITHUB_SHA::7}"
+          mv build-win/app-win64.zip "build-win/ffmpeg_capture_recorder-win64-${SHORT}.zip"
+          echo "ARTIFACT=build-win/ffmpeg_capture_recorder-win64-${SHORT}.zip" >> "$GITHUB_ENV"
 
-      - name: Publish prerelease
-        uses: softprops/action-gh-release@v2
+      - name: Create / update nightly pre-release
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: ${{ steps.meta.outputs.name }}
+          tag: nightly
+          name: "Nightly Build"
+          body: |
+            Automated pre-release
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+            **Run:** #${{ github.run_number }}
+          artifacts: ${{ env.ARTIFACT }}
           prerelease: true
-          generate_release_notes: true
-          files: |
-            build-win/app-win64.zip
+          allowUpdates: true
+          removeArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
