@@ -21,11 +21,17 @@ jobs:
       - name: Build Docker image
         run: docker build -t my-qt6-win -f Dockerfile .
 
+      - name: Prepare writable home for Wine
+        run: mkdir -p "$GITHUB_WORKSPACE/.ci-home"
+
       - name: Build Windows app
         run: |
           docker run --rm \
-            --user 0:0 \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp/home \
+            -e WINEPREFIX=/tmp/home/.wine \
             -v "$GITHUB_WORKSPACE:/home/user/project" \
+            -v "$GITHUB_WORKSPACE/.ci-home:/tmp/home" \
             my-qt6-win
 
       - name: Create release metadata
