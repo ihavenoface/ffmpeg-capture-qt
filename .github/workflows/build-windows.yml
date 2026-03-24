@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     permissions:
       contents: write
 
@@ -14,28 +14,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build (cross-compile Windows via Docker)
-        run: |
-          docker run --rm \
-            -v "${{ github.workspace }}:/home/user/project" \
-            stateoftheartio/qt6:6.6-mingw-aqt
+      - name: Install Qt6 (MinGW)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.6.*"
+          arch: win64_mingw
+          tools: "tools_mingw1120"   # MinGW 11.2 — matches Qt 6.6
+          cache: true
 
-      - name: Rename artifact with commit SHA
+      - name: Build
         run: |
-          SHORT="${GITHUB_SHA::7}"
-          mv build-win/app-win64.zip "build-win/ffmpeg_capture_recorder-win64-${SHORT}.zip"
-          echo "ARTIFACT=build-win/ffmpeg_capture_recorder-win64-${SHORT}.zip" >> "$GITHUB_ENV"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
 
-      - name: Create / update nightly pre-release
+      - name: Deploy with windeployqt
+        run: |
+          New-Item -ItemType Directory -Path build\deploy | Out-Null
+          windeployqt `
+            --dir build\deploy `
+            --libdir build\deploy `
+            --plugindir build\deploy\plugins `
+            build\ffmpeg_capture_recorder.exe
+          Copy-Item build\ffmpeg_capture_recorder.exe build\deploy\
+
+      - name: Zip artifact
+        run: |
+          $short = "${{ github.sha }}".Substring(0, 7)
+          $zip   = "ffmpeg_capture_recorder-win64-$short.zip"
+          Compress-Archive -Path build\deploy\* -DestinationPath $zip
+          echo "ARTIFACT=$zip" >> $env:GITHUB_ENV
+
+      - name: Publish pre-release
         uses: ncipollo/release-action@v1
         with:
           tag: nightly
           name: "Nightly Build"
           body: |
-            Automated pre-release
             **Commit:** ${{ github.sha }}
             **Branch:** ${{ github.ref_name }}
-            **Run:** #${{ github.run_number }}
+            **Run:** \#${{ github.run_number }}
           artifacts: ${{ env.ARTIFACT }}
           prerelease: true
           allowUpdates: true
