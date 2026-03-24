@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t my-qt6-win -f Dockerfile-2 .
+        run: docker build -t my-qt6-win -f Dockerfile .
 
       - name: Build Windows app
         run: |
