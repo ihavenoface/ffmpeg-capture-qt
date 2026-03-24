@@ -1,4 +1,4 @@
-name: build-windows
+name: build-windows-release
 
 on:
   push:
@@ -6,6 +6,9 @@ on:
       - main
       - master
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -16,24 +19,30 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t my-qt6-win -f Dockerfile .
+        run: docker build -t my-qt6-win -f Dockerfile-2 .
 
       - name: Build Windows app
         run: |
           docker run --rm \
+            --user 0:0 \
             -v "$GITHUB_WORKSPACE:/home/user/project" \
             my-qt6-win
 
-      - name: Upload packaged app
-        uses: actions/upload-artifact@v4
-        with:
-          name: ffmpeg_capture_recorder-win64
-          path: build-win/app-win64.zip
-          if-no-files-found: error
+      - name: Create release metadata
+        id: meta
+        run: |
+          TAG="pre-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          NAME="Windows prerelease ${GITHUB_RUN_NUMBER}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Upload raw deploy folder
-        uses: actions/upload-artifact@v4
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v2
         with:
-          name: ffmpeg_capture_recorder-win64-deploy
-          path: build-win/deploy
-          if-no-files-found: error
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.meta.outputs.name }}
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            build-win/app-win64.zip
