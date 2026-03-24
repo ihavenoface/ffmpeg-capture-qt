@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     permissions:
       contents: write
 
@@ -14,35 +14,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Qt6 (MinGW)
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.6.*"
-          arch: win64_mingw
-          tools: "tools_mingw1120"   # MinGW 11.2 — matches Qt 6.6
-          cache: true
+      - name: Build Docker image
+        run: docker build -t my-qt6-win .
 
-      - name: Build
+      - name: Run build
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --parallel
+          docker run --rm \
+            -v "${{ github.workspace }}:/home/user/project" \
+            my-qt6-win
 
-      - name: Deploy with windeployqt
+      - name: Rename artifact
         run: |
-          New-Item -ItemType Directory -Path build\deploy | Out-Null
-          windeployqt `
-            --dir build\deploy `
-            --libdir build\deploy `
-            --plugindir build\deploy\plugins `
-            build\ffmpeg_capture_recorder.exe
-          Copy-Item build\ffmpeg_capture_recorder.exe build\deploy\
-
-      - name: Zip artifact
-        run: |
-          $short = "${{ github.sha }}".Substring(0, 7)
-          $zip   = "ffmpeg_capture_recorder-win64-$short.zip"
-          Compress-Archive -Path build\deploy\* -DestinationPath $zip
-          echo "ARTIFACT=$zip" >> $env:GITHUB_ENV
+          SHORT="${GITHUB_SHA::7}"
+          mv build-win/app-win64.zip "ffmpeg_capture_recorder-win64-${SHORT}.zip"
+          echo "ARTIFACT=ffmpeg_capture_recorder-win64-${SHORT}.zip" >> "$GITHUB_ENV"
 
       - name: Publish pre-release
         uses: ncipollo/release-action@v1
