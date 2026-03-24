@@ -1,0 +1,66 @@
+name: Build & Pre-Release
+
+on:
+  push:
+    branches: ["**"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt6 (MinGW)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.6.*"
+          arch: win64_mingw
+          tools: "tools_mingw90"
+          cache: true
+
+      - name: Add MinGW to PATH
+        run: echo "${{ env.IQTA_TOOLS }}\mingw1120_64\bin" >> $env:GITHUB_PATH
+
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: Deploy with windeployqt
+        run: |
+          New-Item -ItemType Directory -Path build\deploy | Out-Null
+          windeployqt `
+            --dir build\deploy `
+            --libdir build\deploy `
+            --plugindir build\deploy\plugins `
+            build\ffmpeg_capture_recorder.exe
+          Copy-Item build\ffmpeg_capture_recorder.exe build\deploy\
+
+      - name: Zip artifact
+        run: |
+          $short = "${{ github.sha }}".Substring(0, 7)
+          $zip   = "ffmpeg_capture_recorder-win64-$short.zip"
+          Compress-Archive -Path build\deploy\* -DestinationPath $zip
+          echo "ARTIFACT=$zip" >> $env:GITHUB_ENV
+
+      - name: Publish pre-release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: nightly
+          name: "Nightly Build"
+          body: |
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+            **Run:** \#${{ github.run_number }}
+          artifacts: ${{ env.ARTIFACT }}
+          prerelease: true
+          allowUpdates: true
+          removeArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
