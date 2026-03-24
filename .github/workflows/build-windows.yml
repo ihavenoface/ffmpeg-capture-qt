@@ -20,6 +20,7 @@ jobs:
       - name: Run build
         run: |
           docker run --rm \
+            --user root \
             -v "${{ github.workspace }}:/home/user/project" \
             my-qt6-win
 
