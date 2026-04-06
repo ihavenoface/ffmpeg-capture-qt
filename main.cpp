@@ -486,7 +486,7 @@ private:
         p.waitForFinished(10000);
 
         const QString text = QString::fromLocal8Bit(p.readAllStandardError()) + QString::fromLocal8Bit(p.readAllStandardOutput());
-        QRegularExpression re(R"("([^"]+)"\s+\((video|audio)\))");
+        QRegularExpression re(QStringLiteral("\"([^\"]+)\"\\s+\\((video|audio)\\)"));
         QSet<QString> vids, auds;
 
         for (const QString &line : text.split('\n')) {
@@ -828,7 +828,7 @@ private:
 
     std::optional<DvStatus> parseDvStatus(const QString &text) const {
         static const QRegularExpression re(
-            R"(^"(?<file>.+)":\s+(?<mib>[0-9.]+)\s+MiB\s+(?<frames>\d+)\s+frames.*timecode\s+(?<tc>[0-9:.]+)(?:\s+date\s+(?<date>.+))?$)"
+            QStringLiteral("^\"(?<file>.+)\":\\s+(?<mib>[0-9.]+)\\s+MiB\\s+(?<frames>\\d+)\\s+frames.*timecode\\s+(?<tc>[0-9:.]+)(?:\\s+date\\s+(?<date>.+))?$")
         );
 
         DvStatus best;
