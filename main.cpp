@@ -119,6 +119,10 @@ public:
         timer->setInterval(1000);
         connect(timer, &QTimer::timeout, this, &MainWindow::onTimerTick);
 
+        dvMonitorTimer = new QTimer(this);
+        dvMonitorTimer->setInterval(2000);
+        connect(dvMonitorTimer, &QTimer::timeout, this, &MainWindow::refreshDvgrabMonitor);
+
         resize(1200, 700);
         setWindowTitle("FFmpeg Capture Recorder + DV Grab");
     }
@@ -126,6 +130,7 @@ public:
     ~MainWindow() override {
         stopPreview();
         stopRecording(true);
+        stopDvgrabMonitor();
         stopDvgrab();
     }
 
@@ -165,7 +170,14 @@ private:
     QLabel *dvStatusLabel = nullptr;
     QPushButton *dvStartBtn = nullptr;
     QPushButton *dvStopBtn = nullptr;
+    QPushButton *dvAttachBtn = nullptr;
+    QPushButton *dvRefreshMonitorBtn = nullptr;
+    QPushButton *dvDetachMonitorBtn = nullptr;
+    QPushButton *dvShutdownBtn = nullptr;
+    QPlainTextEdit *dvMonitorEdit = nullptr;
+    QTimer *dvMonitorTimer = nullptr;
     QProcess *dvgrabProc = nullptr;
+    QProcess *dvMonitorProc = nullptr;
     QString currentDvSessionName;
 
     void buildUi() {
@@ -284,6 +296,10 @@ private:
         return tape.isEmpty() ? QString() : ("dvgrab-" + tape);
     }
 
+    QString activeDvSessionName() const {
+        return currentDvSessionName.isEmpty() ? buildDvgrabSessionName() : currentDvSessionName;
+    }
+
     QString buildDvgrabInnerCommand() const {
         const QString tape = sanitizeTapeName(tapeNameEdit ? tapeNameEdit->text() : QString());
         const QString base = remoteBaseEdit ? remoteBaseEdit->text().trimmed() : QString();
@@ -311,10 +327,26 @@ private:
                "; else nohup sh -lc " + innerQ + " >" + logPathQ + " 2>&1 < /dev/null & fi";
     }
 
-    QString buildDvgrabAttachHint() const {
-        const QString session = currentDvSessionName.isEmpty() ? buildDvgrabSessionName() : currentDvSessionName;
+    QString buildDvgrabMonitorCommand() const {
+        const QString session = activeDvSessionName();
         if (session.isEmpty()) return {};
-        return "Attach with: byobu attach -t " + session + "  (or tmux attach -t " + session + ")";
+
+        const QString sessionQ = shellSingleQuote(session);
+        const QString logPathQ = shellSingleQuote("/tmp/" + session + ".log");
+        return "if command -v byobu >/dev/null 2>&1 && byobu has-session -t " + sessionQ + " 2>/dev/null; then "
+               "byobu capture-pane -p -S -200 -t " + sessionQ +
+               "; elif command -v tmux >/dev/null 2>&1 && tmux has-session -t " + sessionQ + " 2>/dev/null; then "
+               "tmux capture-pane -p -S -200 -t " + sessionQ +
+               "; elif test -f " + logPathQ + "; then tail -n 200 " + logPathQ +
+               "; else echo '[session not found]'; exit 1; fi";
+    }
+
+    QString buildRemoteShutdownCommand() const {
+        const QString inner =
+            "sleep 1; if command -v systemctl >/dev/null 2>&1; then "
+            "sudo -n systemctl poweroff || systemctl poweroff || sudo -n shutdown -h now || shutdown -h now; "
+            "else sudo -n shutdown -h now || shutdown -h now; fi";
+        return "nohup sh -lc " + shellSingleQuote(inner) + " >/tmp/remote-poweroff.log 2>&1 < /dev/null &";
     }
 
     void updateDvgrabPreview() {
@@ -326,11 +358,16 @@ private:
         const QString base = remoteBaseEdit->text().trimmed();
         const QString target = sshTargetEdit->text().trimmed();
         const QString session = buildDvgrabSessionName();
+        const bool canAddressSession = !target.isEmpty() && !session.isEmpty();
 
         if (tape.isEmpty() || base.isEmpty()) {
             remoteDirLabel->setText("Remote Folder: -");
             dvCmdPreview->setText("Enter a tape name to build the detached dvgrab command.");
             dvStartBtn->setEnabled(false);
+            if (dvAttachBtn) dvAttachBtn->setEnabled(false);
+            if (dvRefreshMonitorBtn) dvRefreshMonitorBtn->setEnabled(false);
+            if (dvDetachMonitorBtn) dvDetachMonitorBtn->setEnabled(dvMonitorTimer && dvMonitorTimer->isActive());
+            if (dvShutdownBtn) dvShutdownBtn->setEnabled(!target.isEmpty());
             return;
         }
 
@@ -341,11 +378,19 @@ private:
         if (target.isEmpty()) {
             dvCmdPreview->setText(remoteCmd);
             dvStartBtn->setEnabled(false);
+            if (dvAttachBtn) dvAttachBtn->setEnabled(false);
+            if (dvRefreshMonitorBtn) dvRefreshMonitorBtn->setEnabled(false);
+            if (dvDetachMonitorBtn) dvDetachMonitorBtn->setEnabled(dvMonitorTimer && dvMonitorTimer->isActive());
+            if (dvShutdownBtn) dvShutdownBtn->setEnabled(false);
             return;
         }
 
         dvCmdPreview->setText("ssh " + target + " " + remoteCmd);
         dvStartBtn->setEnabled(dvgrabProc == nullptr);
+        if (dvAttachBtn) dvAttachBtn->setEnabled(canAddressSession);
+        if (dvRefreshMonitorBtn) dvRefreshMonitorBtn->setEnabled(canAddressSession && dvMonitorProc == nullptr);
+        if (dvDetachMonitorBtn) dvDetachMonitorBtn->setEnabled(dvMonitorTimer && dvMonitorTimer->isActive());
+        if (dvShutdownBtn) dvShutdownBtn->setEnabled(true);
     }
 
     QWidget* buildDvgrabTab() {
@@ -373,29 +418,51 @@ private:
         form->addRow("Command", dvCmdPreview);
 
         auto *hint = new QLabel(
-            "This panel connects over SSH, creates /mnt/data/<tapename>, and starts "
-            "dvgrab in a detached byobu or tmux session so the server keeps recording after you disconnect or reboot."
+            "This panel connects over SSH, creates /mnt/data/<tapename>, starts dvgrab in a detached byobu or tmux session, "
+            "can monitor the running session inside the app, and can shut down the remote recorder when you are done."
         );
         hint->setWordWrap(true);
         hint->setStyleSheet("color: palette(mid);");
 
         dvStartBtn = new QPushButton("Start Detached DV Capture");
         dvStopBtn = new QPushButton("Stop Remote Session");
+        dvAttachBtn = new QPushButton("Attach / Monitor Session");
+        dvRefreshMonitorBtn = new QPushButton("Refresh Snapshot");
+        dvDetachMonitorBtn = new QPushButton("Stop Monitoring");
+        dvShutdownBtn = new QPushButton("Shut Down Remote Machine");
+
         dvStopBtn->setEnabled(false);
+        dvDetachMonitorBtn->setEnabled(false);
+
         dvStatusLabel = new QLabel("Ready - enter a tape name to prepare the detached capture session.");
         dvStatusLabel->setWordWrap(true);
 
         auto *btnRow = new QHBoxLayout;
         btnRow->addWidget(dvStartBtn);
         btnRow->addWidget(dvStopBtn);
+        btnRow->addWidget(dvAttachBtn);
+        btnRow->addWidget(dvRefreshMonitorBtn);
+        btnRow->addWidget(dvDetachMonitorBtn);
+        btnRow->addWidget(dvShutdownBtn);
         btnRow->addStretch();
+
+        dvMonitorEdit = new QPlainTextEdit;
+        dvMonitorEdit->setReadOnly(true);
+        dvMonitorEdit->setLineWrapMode(QPlainTextEdit::NoWrap);
+        dvMonitorEdit->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        dvMonitorEdit->setPlaceholderText("Session output will appear here after you attach to the detached byobu/tmux session.");
+        dvMonitorEdit->setMinimumHeight(260);
+
+        auto *monitorBox = new QGroupBox("Session Monitor");
+        auto *monitorLayout = new QVBoxLayout(monitorBox);
+        monitorLayout->addWidget(dvMonitorEdit);
 
         auto *layout = new QVBoxLayout(tab);
         layout->addWidget(hint);
         layout->addLayout(form);
         layout->addLayout(btnRow);
         layout->addWidget(dvStatusLabel);
-        layout->addStretch();
+        layout->addWidget(monitorBox, 1);
 
         connect(sshTargetEdit, &QLineEdit::textChanged, this, [this] { updateDvgrabPreview(); });
         connect(remoteBaseEdit, &QLineEdit::textChanged, this, [this] { updateDvgrabPreview(); });
@@ -405,6 +472,10 @@ private:
         });
         connect(dvStartBtn, &QPushButton::clicked, this, &MainWindow::startDvgrab);
         connect(dvStopBtn, &QPushButton::clicked, this, &MainWindow::stopDvgrab);
+        connect(dvAttachBtn, &QPushButton::clicked, this, &MainWindow::startDvgrabMonitor);
+        connect(dvRefreshMonitorBtn, &QPushButton::clicked, this, &MainWindow::refreshDvgrabMonitor);
+        connect(dvDetachMonitorBtn, &QPushButton::clicked, this, &MainWindow::stopDvgrabMonitor);
+        connect(dvShutdownBtn, &QPushButton::clicked, this, &MainWindow::shutdownRemoteMachine);
 
         updateDvgrabPreview();
         return tab;
@@ -717,8 +788,9 @@ private:
                 this, [this](int code, QProcess::ExitStatus status) {
             const bool ok = (status == QProcess::NormalExit && code == 0);
             if (ok) {
-                dvStatusLabel->setText("Detached capture started in session '" + currentDvSessionName + "'. You can reboot this computer now. " + buildDvgrabAttachHint());
+                dvStatusLabel->setText("Detached capture started in session '" + currentDvSessionName + "'. Use Attach / Monitor Session to follow progress in the app.");
                 dvStopBtn->setEnabled(true);
+                QTimer::singleShot(0, this, &MainWindow::startDvgrabMonitor);
             } else {
                 dvStatusLabel->setText(QString("Failed to launch detached DV capture (exit code %1).").arg(code));
                 dvStopBtn->setEnabled(false);
@@ -744,6 +816,91 @@ private:
         }
     }
 
+    void startDvgrabMonitor() {
+        if (!sshTargetEdit || !dvStatusLabel || !dvMonitorEdit || !dvMonitorTimer) return;
+
+        const QString target = sshTargetEdit->text().trimmed();
+        const QString session = activeDvSessionName();
+        if (target.isEmpty()) {
+            QMessageBox::warning(this, "SSH Target", "Please enter an SSH target before attaching to the session.");
+            return;
+        }
+        if (session.isEmpty()) {
+            QMessageBox::warning(this, "Session", "Please enter a tape name so the session can be derived.");
+            return;
+        }
+
+        currentDvSessionName = session;
+        dvMonitorEdit->setPlainText("Attaching monitor to session '" + session + "'...");
+        dvStatusLabel->setText("Monitoring session '" + session + "' inside the app.");
+        dvMonitorTimer->start();
+        refreshDvgrabMonitor();
+        updateDvgrabPreview();
+    }
+
+    void refreshDvgrabMonitor() {
+        if (dvMonitorProc || !sshTargetEdit || !dvMonitorEdit) return;
+
+        const QString target = sshTargetEdit->text().trimmed();
+        const QString session = activeDvSessionName();
+        const QString monitorCmd = buildDvgrabMonitorCommand();
+        if (target.isEmpty() || session.isEmpty() || monitorCmd.isEmpty()) {
+            updateDvgrabPreview();
+            return;
+        }
+
+        dvMonitorProc = new QProcess(this);
+        hideChildConsole(*dvMonitorProc);
+
+        connect(dvMonitorProc, QOverload<int,QProcess::ExitStatus>::of(&QProcess::finished),
+                this, [this, session](int code, QProcess::ExitStatus status) {
+            QString textOut = QString::fromLocal8Bit(dvMonitorProc->readAllStandardOutput());
+            const QString textErr = QString::fromLocal8Bit(dvMonitorProc->readAllStandardError());
+            if (!textErr.trimmed().isEmpty()) {
+                if (!textOut.isEmpty() && !textOut.endsWith('
+')) textOut += '
+';
+                textOut += textErr;
+            }
+            if (textOut.trimmed().isEmpty()) textOut = "[no output yet]";
+            dvMonitorEdit->setPlainText(textOut);
+            auto *bar = dvMonitorEdit->verticalScrollBar();
+            bar->setValue(bar->maximum());
+
+            const bool ok = (status == QProcess::NormalExit && code == 0);
+            if (!ok && dvMonitorTimer && dvMonitorTimer->isActive()) {
+                dvMonitorTimer->stop();
+                dvStatusLabel->setText("Monitor lost session '" + session + "'.");
+            }
+
+            dvMonitorProc->deleteLater();
+            dvMonitorProc = nullptr;
+            updateDvgrabPreview();
+        });
+
+        dvMonitorProc->start("ssh", {target, monitorCmd});
+        if (!dvMonitorProc->waitForStarted(5000)) {
+            dvStatusLabel->setText("Failed to start monitor SSH: " + dvMonitorProc->errorString());
+            dvMonitorProc->deleteLater();
+            dvMonitorProc = nullptr;
+            updateDvgrabPreview();
+        }
+    }
+
+    void stopDvgrabMonitor() {
+        if (dvMonitorTimer) dvMonitorTimer->stop();
+        if (dvMonitorProc) {
+            dvMonitorProc->kill();
+            dvMonitorProc->waitForFinished(3000);
+            dvMonitorProc->deleteLater();
+            dvMonitorProc = nullptr;
+        }
+        if (dvStatusLabel && !activeDvSessionName().isEmpty()) {
+            dvStatusLabel->setText("Stopped monitoring session '" + activeDvSessionName() + "'.");
+        }
+        updateDvgrabPreview();
+    }
+
     void stopDvgrab() {
         if (dvgrabProc) {
             dvgrabProc->terminate();
@@ -754,12 +911,15 @@ private:
             return;
         }
 
-        if (!sshTargetEdit || !dvStatusLabel || currentDvSessionName.isEmpty()) return;
+        if (!sshTargetEdit || !dvStatusLabel || activeDvSessionName().isEmpty()) return;
 
         const QString target = sshTargetEdit->text().trimmed();
         if (target.isEmpty()) return;
 
-        const QString sessionQ = shellSingleQuote(currentDvSessionName);
+        stopDvgrabMonitor();
+
+        const QString session = activeDvSessionName();
+        const QString sessionQ = shellSingleQuote(session);
         const QString stopCmd =
             "if command -v byobu >/dev/null 2>&1; then byobu kill-session -t " + sessionQ +
             "; elif command -v tmux >/dev/null 2>&1; then tmux kill-session -t " + sessionQ +
@@ -767,8 +927,8 @@ private:
 
         QProcess p;
         hideChildConsole(p);
-        dvStatusLabel->setText("Stopping detached DV session '" + currentDvSessionName + "'...");
-        appendLog("Stopping detached DV session '" + currentDvSessionName + "'.");
+        dvStatusLabel->setText("Stopping detached DV session '" + session + "'...");
+        appendLog("Stopping detached DV session '" + session + "'.");
         p.start("ssh", {target, stopCmd});
         if (!p.waitForFinished(10000) || p.exitStatus() != QProcess::NormalExit || p.exitCode() != 0) {
             appendLog(QString::fromLocal8Bit(p.readAllStandardError()));
@@ -779,9 +939,54 @@ private:
 
         appendLog(QString::fromLocal8Bit(p.readAllStandardError()));
         appendLog(QString::fromLocal8Bit(p.readAllStandardOutput()));
-        dvStatusLabel->setText("Detached DV session stopped: " + currentDvSessionName);
+        dvStatusLabel->setText("Detached DV session stopped: " + session);
         currentDvSessionName.clear();
+        if (dvMonitorEdit) dvMonitorEdit->setPlainText("[session stopped]");
         dvStopBtn->setEnabled(false);
+        updateDvgrabPreview();
+    }
+
+    void shutdownRemoteMachine() {
+        if (!sshTargetEdit || !dvStatusLabel) return;
+
+        const QString target = sshTargetEdit->text().trimmed();
+        if (target.isEmpty()) {
+            QMessageBox::warning(this, "SSH Target", "Please enter an SSH target before shutting down the remote machine.");
+            return;
+        }
+
+        const auto answer = QMessageBox::warning(
+            this,
+            "Shut Down Remote Machine",
+            "This will power off the remote recorder and end any running capture session. Continue?",
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No
+        );
+        if (answer != QMessageBox::Yes) return;
+
+        stopDvgrabMonitor();
+
+        QProcess p;
+        hideChildConsole(p);
+        appendLog("Requesting remote shutdown on '" + target + "'.");
+        p.start("ssh", {target, buildRemoteShutdownCommand()});
+        if (!p.waitForFinished(10000)) {
+            appendLog(QString::fromLocal8Bit(p.readAllStandardError()));
+            appendLog(QString::fromLocal8Bit(p.readAllStandardOutput()));
+            dvStatusLabel->setText("Shutdown request sent; the remote machine may already be powering off.");
+        } else if (p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0) {
+            appendLog(QString::fromLocal8Bit(p.readAllStandardError()));
+            appendLog(QString::fromLocal8Bit(p.readAllStandardOutput()));
+            dvStatusLabel->setText("Remote shutdown command sent successfully.");
+        } else {
+            appendLog(QString::fromLocal8Bit(p.readAllStandardError()));
+            appendLog(QString::fromLocal8Bit(p.readAllStandardOutput()));
+            dvStatusLabel->setText("Remote shutdown command returned a non-zero exit code.");
+        }
+
+        currentDvSessionName.clear();
+        if (dvMonitorEdit) dvMonitorEdit->setPlainText("[remote shutdown requested]");
+        if (dvStopBtn) dvStopBtn->setEnabled(false);
         updateDvgrabPreview();
     }
 
