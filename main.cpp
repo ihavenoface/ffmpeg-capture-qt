@@ -688,9 +688,9 @@ private:
         const QString innerQ = shellSingleQuote(inner);
         const QString logQ = shellSingleQuote("/tmp/" + session + ".log");
         return "if command -v byobu >/dev/null 2>&1; then "
-               "byobu new-session -d -s " + sessionQ + " sh -lc " + innerQ +
+               "byobu new-session -d -s " + sessionQ + " -x 220 -y 40 sh -lc " + innerQ +
                "; elif command -v tmux >/dev/null 2>&1; then "
-               "tmux new-session -d -s " + sessionQ + " sh -lc " + innerQ +
+               "tmux new-session -d -s " + sessionQ + " -x 220 -y 40 sh -lc " + innerQ +
                "; else nohup sh -lc " + innerQ + " >" + logQ + " 2>&1 < /dev/null & fi";
     }
 
@@ -700,9 +700,9 @@ private:
         const QString sessionQ = shellSingleQuote(session);
         const QString logQ = shellSingleQuote("/tmp/" + session + ".log");
         return "if command -v byobu >/dev/null 2>&1 && byobu has-session -t " + sessionQ + " 2>/dev/null; then "
-               "byobu capture-pane -p -S -30 -t " + sessionQ +
+               "byobu capture-pane -pJ -S -30 -t " + sessionQ +
                "; elif command -v tmux >/dev/null 2>&1 && tmux has-session -t " + sessionQ + " 2>/dev/null; then "
-               "tmux capture-pane -p -S -30 -t " + sessionQ +
+               "tmux capture-pane -pJ -S -30 -t " + sessionQ +
                "; elif test -f " + logQ + "; then tail -n 30 " + logQ +
                "; else echo '[session not found]'; exit 1; fi";
     }
