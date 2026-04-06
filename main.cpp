@@ -857,9 +857,7 @@ private:
             QString textOut = QString::fromLocal8Bit(dvMonitorProc->readAllStandardOutput());
             const QString textErr = QString::fromLocal8Bit(dvMonitorProc->readAllStandardError());
             if (!textErr.trimmed().isEmpty()) {
-                if (!textOut.isEmpty() && !textOut.endsWith('
-')) textOut += '
-';
+                if (!textOut.isEmpty() && !textOut.endsWith(QChar('\n'))) textOut += QChar('\n');
                 textOut += textErr;
             }
             if (textOut.trimmed().isEmpty()) textOut = "[no output yet]";
