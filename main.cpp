@@ -866,11 +866,21 @@ private:
     QString resolveDvPreviewPath(QString filePath) const {
         filePath = filePath.trimmed();
         if (filePath.isEmpty()) return {};
+
+        if (isRemoteDvMode()) {
+            if (filePath.startsWith('/')) return filePath;
+            const QString captureDir = dvCaptureDir();
+            if (captureDir.isEmpty()) return filePath;
+            QString base = captureDir;
+            while (base.endsWith('/')) base.chop(1);
+            return base + "/" + filePath;
+        }
+
         QFileInfo info(filePath);
         if (info.isAbsolute()) return QDir::cleanPath(info.absoluteFilePath());
         const QString captureDir = dvCaptureDir();
         if (captureDir.isEmpty()) return QDir::cleanPath(filePath);
-        return QDir(captureDir).filePath(filePath);
+        return QDir::cleanPath(QDir(captureDir).filePath(filePath));
     }
 
     QString findNewestDvSegment() const {
@@ -957,7 +967,7 @@ private:
                 if (!lastDvFile.isEmpty()) {
                     startDvFilePreview(lastDvFile);
                 } else {
-                    const QString fallbackFile = findNewestDvSegment();
+                    const QString fallbackFile = resolveDvPreviewPath(findNewestDvSegment());
                     if (!fallbackFile.isEmpty()) {
                         lastDvFile = fallbackFile;
                         startDvFilePreview(fallbackFile);
@@ -1419,7 +1429,7 @@ private:
         }
 
         const DvStatus &s = *status;
-        const QString previewFile = s.resolvedFile.isEmpty() ? resolveDvPreviewPath(s.file) : s.resolvedFile;
+        const QString previewFile = resolveDvPreviewPath(s.resolvedFile.isEmpty() ? s.file : s.resolvedFile);
         const bool fileChanged = (lastDvFile != previewFile);
         const QString key = previewFile + "|" + s.timecode + "|" + QString::number(s.frames / 25);
 
