@@ -208,6 +208,9 @@ private:
     QPushButton *dvShutdownBtn = nullptr;
     QTimer *dvMonitorTimer = nullptr;
 
+    QWidget *durationRow = nullptr;
+    QLabel *durationLabel = nullptr;
+    QCheckBox *remotePoweroffAfterStopCheck = nullptr;
     QLineEdit *durEdit = nullptr;
     QLabel *previewLabel = nullptr;
     QLabel *timerLabel = nullptr;
@@ -310,15 +313,26 @@ private:
 
         auto *topForm = new QFormLayout;
         topForm->addRow("Mode", modeSelect);
-        topForm->addRow("Duration", durEdit);
+        durationRow = new QWidget;
+        auto *durationLayout = new QHBoxLayout(durationRow);
+        durationLayout->setContentsMargins(0, 0, 0, 0);
+        durationLayout->addWidget(durEdit);
+        durationLabel = new QLabel("Duration");
+        durationLabel->setBuddy(durEdit);
+        topForm->addRow(durationLabel, durationRow);
         leftLayout->addLayout(topForm);
         leftLayout->addWidget(modeStack, 1);
+
+        remotePoweroffAfterStopCheck = new QCheckBox("Power off remote machine when capture stops");
+        remotePoweroffAfterStopCheck->setVisible(false);
+        remotePoweroffAfterStopCheck->setEnabled(false);
 
         auto *btnRow = new QHBoxLayout;
         btnRow->addWidget(previewBtn);
         btnRow->addWidget(recordBtn);
         btnRow->addStretch();
         leftLayout->addLayout(btnRow);
+        leftLayout->addWidget(remotePoweroffAfterStopCheck);
         leftLayout->addWidget(progress);
         leftLayout->addWidget(statusLabel);
 
@@ -384,6 +398,7 @@ private:
 
         auto *refreshBtn = new QPushButton("Refresh Remote Devices");
         connect(refreshBtn, &QPushButton::clicked, this, &MainWindow::refreshRemoteDevices);
+        connect(remoteFfmpegTargetEdit, &QLineEdit::textChanged, this, [this] { updateModeUi(); });
 
         auto *layout = new QVBoxLayout(page);
         layout->addWidget(hint);
@@ -497,7 +512,10 @@ private:
         layout->addWidget(eventBox, 1);
         layout->addWidget(verboseBox);
 
-        connect(dvTargetEdit, &QLineEdit::textChanged, this, &MainWindow::updateDvUi);
+        connect(dvTargetEdit, &QLineEdit::textChanged, this, [this] {
+            updateDvUi();
+            updateModeUi();
+        });
         connect(dvBaseEdit, &QLineEdit::textChanged, this, &MainWindow::updateDvUi);
         connect(tapeNameEdit, &QLineEdit::textChanged, this, &MainWindow::updateDvUi);
         connect(tapeNameEdit, &QLineEdit::returnPressed, this, [this] {
@@ -574,6 +592,23 @@ private:
 
     void updateModeUi() {
         modeStack->setCurrentIndex(isDvMode() ? 2 : (isRemoteFfmpegMode() ? 1 : 0));
+
+        const bool ffmpegMode = isFfmpegMode();
+        const bool remoteMode = isRemoteFfmpegMode() || isRemoteDvMode();
+        const QString remoteTarget = isRemoteFfmpegMode()
+            ? remoteFfmpegTargetEdit->text().trimmed()
+            : (isRemoteDvMode() ? dvTargetEdit->text().trimmed() : QString());
+
+        if (durationLabel) durationLabel->setVisible(ffmpegMode);
+        if (durationRow) durationRow->setVisible(ffmpegMode);
+        if (durEdit) durEdit->setEnabled(ffmpegMode);
+        if (progress) progress->setVisible(ffmpegMode);
+
+        if (remotePoweroffAfterStopCheck) {
+            remotePoweroffAfterStopCheck->setVisible(remoteMode);
+            remotePoweroffAfterStopCheck->setEnabled(remoteMode && !remoteTarget.isEmpty());
+            if (!remoteMode) remotePoweroffAfterStopCheck->setChecked(false);
+        }
 
         if (dvTargetRow) dvTargetRow->setVisible(isRemoteDvMode());
         if (dvShutdownBtn) dvShutdownBtn->setVisible(isRemoteDvMode());
@@ -1034,16 +1069,35 @@ private:
 
     void stopRecording(bool force) {
         if (!recordProc) return;
+
+        bool stopped = false;
         if (!force) {
             recordProc->write("q");
-            if (recordProc->waitForFinished(3000)) return;
+            stopped = recordProc->waitForFinished(3000);
         }
-        recordProc->kill();
-        recordProc->waitForFinished(3000);
+        if (!stopped) {
+            recordProc->kill();
+            recordProc->waitForFinished(3000);
+        }
+
         timer->stop();
         timerLabel->hide();
         previewBtn->setEnabled(true);
         recordBtn->setText("Start Recording");
+
+        if (isRemoteFfmpegMode() && remotePoweroffAfterStopCheck && remotePoweroffAfterStopCheck->isChecked()) {
+            const QString target = remoteFfmpegTargetEdit->text().trimmed();
+            if (!target.isEmpty()) {
+                appendLog("Requesting remote poweroff after recording stop.");
+                runSyncShell(true, target, buildRemotePoweroffCommand(), 5000);
+                setStatus("Remote recording stopped. Poweroff requested.");
+            } else {
+                setStatus("Recording stopped by user.");
+            }
+            remotePoweroffAfterStopCheck->setChecked(false);
+            return;
+        }
+
         setStatus("Recording stopped by user.");
     }
 
@@ -1122,10 +1176,10 @@ private:
                "; else pkill -f " + pattQ + "; fi";
     }
 
-    QString buildDvShutdownCommand() const {
+    QString buildRemotePoweroffCommand() const {
         const QString inner =
-            "sleep 1; if command -v systemctl >/dev/null 2>&1; then "
-            "sudo -n systemctl poweroff || systemctl poweroff || sudo -n shutdown -h now || shutdown -h now; "
+            "sleep 1; if command -v poweroff >/dev/null 2>&1; then "
+            "sudo -n poweroff || poweroff || sudo -n shutdown -h now || shutdown -h now; "
             "else sudo -n shutdown -h now || shutdown -h now; fi";
         return "nohup sh -lc " + shellSingleQuote(inner) + " >/tmp/remote-poweroff.log 2>&1 < /dev/null &";
     }
@@ -1383,7 +1437,15 @@ private:
         appendDvEvent("Stopping session " + activeDvSessionName() + ".");
         runSyncShell(isRemoteDvMode(), target, cmd);
 
-        dvStatusLabel->setText("Detached DV session stop requested.");
+        bool requestedPoweroff = false;
+        if (isRemoteDvMode() && remotePoweroffAfterStopCheck && remotePoweroffAfterStopCheck->isChecked()) {
+            appendDvEvent("Remote poweroff requested after capture stop.");
+            runSyncShell(true, target, buildRemotePoweroffCommand(), 5000);
+            remotePoweroffAfterStopCheck->setChecked(false);
+            requestedPoweroff = true;
+        }
+
+        dvStatusLabel->setText(requestedPoweroff ? "Detached DV session stop requested. Poweroff requested." : "Detached DV session stop requested.");
         dvLiveLabel->setText("Session stopped.");
         currentDvSessionName.clear();
         lastDvStatusKey.clear();
@@ -1413,7 +1475,7 @@ private:
 
         stopDvgrabMonitor();
         appendDvEvent("Remote shutdown requested.");
-        runSyncShell(true, target, buildDvShutdownCommand());
+        runSyncShell(true, target, buildRemotePoweroffCommand());
 
         dvStatusLabel->setText("Remote shutdown command sent.");
         dvLiveLabel->setText("Remote machine is shutting down.");
