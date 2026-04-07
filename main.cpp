@@ -20,6 +20,7 @@ struct Param {
 
 struct DvStatus {
     QString file;
+    QString resolvedFile;
     double mib = 0.0;
     qint64 frames = 0;
     QString timecode;
@@ -851,8 +852,40 @@ private:
         setStatus("Remote preview running...");
     }
 
+    QString dvCaptureDir() const {
+        const QString base = dvBaseEdit ? dvBaseEdit->text().trimmed() : QString();
+        const QString tape = sanitizeTapeName(tapeNameEdit ? tapeNameEdit->text() : QString());
+        if (base.isEmpty() || tape.isEmpty()) return {};
+        return QDir::cleanPath(base + "/" + tape);
+    }
+
+    QStringList dvPreviewNameFilters() const {
+        return {"*.dv", "*.dif", "*.avi", "*.mov", "*.mkv"};
+    }
+
+    QString resolveDvPreviewPath(QString filePath) const {
+        filePath = filePath.trimmed();
+        if (filePath.isEmpty()) return {};
+        QFileInfo info(filePath);
+        if (info.isAbsolute()) return QDir::cleanPath(info.absoluteFilePath());
+        const QString captureDir = dvCaptureDir();
+        if (captureDir.isEmpty()) return QDir::cleanPath(filePath);
+        return QDir(captureDir).filePath(filePath);
+    }
+
+    QString findNewestDvSegment() const {
+        const QString captureDir = dvCaptureDir();
+        if (captureDir.isEmpty()) return {};
+        QDir dir(captureDir);
+        if (!dir.exists()) return {};
+        const QFileInfoList entries = dir.entryInfoList(dvPreviewNameFilters(), QDir::Files | QDir::Readable, QDir::Time);
+        if (entries.isEmpty()) return {};
+        return entries.first().absoluteFilePath();
+    }
+
     void startDvFilePreview(const QString &filePath) {
-        if (filePath.trimmed().isEmpty()) {
+        const QString resolvedPath = resolveDvPreviewPath(filePath);
+        if (resolvedPath.isEmpty()) {
             setStatus("No DV file available for preview yet.");
             return;
         }
@@ -872,7 +905,7 @@ private:
 
             QStringList args = {
                 "ffmpeg", "-hide_banner", "-loglevel", "warning", "-re",
-                "-i", filePath,
+                "-i", resolvedPath,
                 "-map", "0:v",
                 "-vf", "scale=720:576",
                 "-f", "mjpeg", "-q:v", "5", "-r", "5", "pipe:1"
@@ -881,7 +914,7 @@ private:
         } else {
             QStringList args = {
                 "-hide_banner", "-loglevel", "warning", "-re",
-                "-i", filePath,
+                "-i", resolvedPath,
                 "-map", "0:v",
                 "-vf", "scale=720:576",
                 "-f", "mjpeg", "-q:v", "5", "-r", "5", "pipe:1"
@@ -899,7 +932,7 @@ private:
         }
 
         previewBtn->setText("Stop Preview");
-        setStatus("DV preview running...");
+        setStatus("DV preview running: " + QFileInfo(resolvedPath).fileName());
     }
 
     void togglePreview() {
@@ -924,8 +957,14 @@ private:
                 if (!lastDvFile.isEmpty()) {
                     startDvFilePreview(lastDvFile);
                 } else {
-                    previewBtn->setText("Stop Preview");
-                    setStatus("DV preview armed - waiting for the first captured file.");
+                    const QString fallbackFile = findNewestDvSegment();
+                    if (!fallbackFile.isEmpty()) {
+                        lastDvFile = fallbackFile;
+                        startDvFilePreview(fallbackFile);
+                    } else {
+                        previewBtn->setText("Stop Preview");
+                        setStatus("DV preview armed - waiting for the first captured file.");
+                    }
                 }
                 break;
         }
@@ -1293,23 +1332,38 @@ private:
     }
 
     std::optional<DvStatus> parseDvStatus(const QString &text) const {
-        static const QRegularExpression re(
-            QStringLiteral("^\"(?<file>.+)\":\\s+(?<mib>[0-9.]+)\\s+MiB\\s+(?<frames>\\d+)\\s+frames.*timecode\\s+(?<tc>[0-9:.]+)(?:\\s+date\\s+(?<date>.+))?$")
+        static const QRegularExpression quotedRe(
+            QStringLiteral("^\"(?<file>[^\"]+)\"\\s*:\\s*(?<mib>[0-9.]+)\\s+MiB\\s+(?<frames>\\d+)\\s+frames(?:.*?timecode\\s+(?<tc>[0-9:.]+))?(?:.*?date\\s+(?<date>.+))?$")
+        );
+        static const QRegularExpression bareRe(
+            QStringLiteral("^(?<file>[^\\s][^:]*?)\\s*:\\s*(?<mib>[0-9.]+)\\s+MiB\\s+(?<frames>\\d+)\\s+frames(?:.*?timecode\\s+(?<tc>[0-9:.]+))?(?:.*?date\\s+(?<date>.+))?$")
         );
 
-        DvStatus best;
-        for (const QString &raw : text.split('\n')) {
-            const QString line = raw.trimmed();
+        auto tryMatch = [&](const QString &line, const QRegularExpression &re) -> std::optional<DvStatus> {
             auto m = re.match(line);
-            if (!m.hasMatch()) continue;
+            if (!m.hasMatch()) return std::nullopt;
             DvStatus s;
-            s.file = m.captured("file");
+            s.file = m.captured("file").trimmed();
+            s.resolvedFile = resolveDvPreviewPath(s.file);
             s.mib = m.captured("mib").toDouble();
             s.frames = m.captured("frames").toLongLong();
-            s.timecode = m.captured("tc");
+            s.timecode = m.captured("tc").trimmed();
             s.recordedAt = m.captured("date").trimmed();
-            s.valid = true;
-            best = s;
+            s.valid = !s.file.isEmpty();
+            if (!s.valid) return std::nullopt;
+            return s;
+        };
+
+        DvStatus best;
+        const QStringList statusLines = text.split('\n');
+        for (auto it = statusLines.crbegin(); it != statusLines.crend(); ++it) {
+            const QString line = it->trimmed();
+            if (line.isEmpty()) continue;
+            auto parsed = tryMatch(line, quotedRe);
+            if (!parsed) parsed = tryMatch(line, bareRe);
+            if (!parsed) continue;
+            best = *parsed;
+            break;
         }
         if (!best.valid) return std::nullopt;
         return best;
@@ -1344,28 +1398,47 @@ private:
         }
 
         auto status = parseDvStatus(paneText);
-        if (!status) return;
+        if (!status) {
+            const QString fallbackFile = findNewestDvSegment();
+            if (!fallbackFile.isEmpty()) {
+                const bool fileChanged = (lastDvFile != fallbackFile);
+                dvLiveLabel->setText(
+                    "File: " + QFileInfo(fallbackFile).fileName() + "\n"
+                    "Full Path: " + fallbackFile + "\n"
+                    "Waiting for detailed dvgrab status..."
+                );
+                if (fileChanged) {
+                    appendDvEvent("New segment: " + fallbackFile);
+                    lastDvFile = fallbackFile;
+                }
+                if (dvPreviewWanted && (fileChanged || !previewProc)) {
+                    startDvFilePreview(fallbackFile);
+                }
+            }
+            return;
+        }
 
         const DvStatus &s = *status;
-        const bool fileChanged = (lastDvFile != s.file);
-        const QString key = s.file + "|" + s.timecode + "|" + QString::number(s.frames / 25);
+        const QString previewFile = s.resolvedFile.isEmpty() ? resolveDvPreviewPath(s.file) : s.resolvedFile;
+        const bool fileChanged = (lastDvFile != previewFile);
+        const QString key = previewFile + "|" + s.timecode + "|" + QString::number(s.frames / 25);
 
         dvLiveLabel->setText(
-            "File: " + QFileInfo(s.file).fileName() + "\n"
-            "Full Path: " + s.file + "\n"
-            "Size: " + QString::number(s.mib, 'f', 2) + " MiB\n"
+            "File: " + QFileInfo(previewFile).fileName() + "\n"
+            "Full Path: " + previewFile + "\n"
+            "Size: " + QString::number(s.mib, "f"[0], 2) + " MiB\n"
             "Frames: " + QString::number(s.frames) + "\n"
-            "Timecode: " + s.timecode +
+            "Timecode: " + (s.timecode.isEmpty() ? QStringLiteral("-") : s.timecode) +
             (s.recordedAt.isEmpty() ? QString() : ("\nRecorded At: " + s.recordedAt))
         );
 
         if (fileChanged) {
-            appendDvEvent("New segment: " + s.file);
-            lastDvFile = s.file;
+            appendDvEvent("New segment: " + previewFile);
+            lastDvFile = previewFile;
         }
 
         if (dvPreviewWanted && (fileChanged || !previewProc)) {
-            startDvFilePreview(s.file);
+            startDvFilePreview(previewFile);
         }
 
         lastDvStatusKey = key;
