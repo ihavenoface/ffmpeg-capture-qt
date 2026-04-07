@@ -621,7 +621,20 @@ private:
             recordBtn->setText(dvSessionActive() ? "Stop Capture" : "Start Capture");
         }
 
-        previewBtn->setText((previewProc || (isDvMode() && dvPreviewWanted)) ? "Stop Preview" : "Start Preview");
+        if (isDvMode()) {
+            dvPreviewWanted = false;
+            if (previewProc) stopPreview();
+            previewBtn->setEnabled(false);
+            previewBtn->setText("Preview Unavailable");
+            previewBtn->setToolTip("DV frame preview was removed because segment-based playback was unreliable.");
+            previewLabel->clear();
+            previewLabel->setText("DV frame preview unavailable. Use Attach / Monitor and the event log instead.");
+        } else {
+            previewBtn->setEnabled(true);
+            previewBtn->setToolTip(QString());
+            previewBtn->setText(previewProc ? "Stop Preview" : "Start Preview");
+            if (!previewProc) previewLabel->setText("Preview");
+        }
 
         if (!recordProc && !previewProc && !dvSessionActive()) {
             switch (currentMode()) {
@@ -765,15 +778,8 @@ private:
                 [this](int, QProcess::ExitStatus) {
             previewProc->deleteLater();
             previewProc = nullptr;
-            if (isDvMode() && dvPreviewWanted) {
-                previewBtn->setText("Stop Preview");
-                setStatus(lastDvFile.isEmpty()
-                              ? "DV preview waiting for the first segment..."
-                              : "DV preview waiting for the next segment...");
-            } else {
-                previewBtn->setText("Start Preview");
-                setStatus("Preview stopped.");
-            }
+            previewBtn->setText("Start Preview");
+            setStatus("Preview stopped.");
         });
     }
 
@@ -894,60 +900,28 @@ private:
     }
 
     void startDvFilePreview(const QString &filePath) {
-        const QString resolvedPath = resolveDvPreviewPath(filePath);
-        if (resolvedPath.isEmpty()) {
-            setStatus("No DV file available for preview yet.");
-            return;
-        }
-
-        preparePreviewProcess();
-
-        if (isRemoteDvMode()) {
-            const QString target = dvTargetEdit->text().trimmed();
-            if (target.isEmpty()) {
-                dvPreviewWanted = false;
-                setStatus("Please enter an SSH target for remote DV preview.");
-                previewProc->deleteLater();
-                previewProc = nullptr;
-                previewBtn->setText("Start Preview");
-                return;
-            }
-
-            QStringList args = {
-                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-re",
-                "-i", resolvedPath,
-                "-map", "0:v",
-                "-vf", "scale=720:576",
-                "-f", "mjpeg", "-q:v", "5", "-r", "5", "pipe:1"
-            };
-            previewProc->start("ssh", {target, shellJoin(args)});
-        } else {
-            QStringList args = {
-                "-hide_banner", "-loglevel", "warning", "-re",
-                "-i", resolvedPath,
-                "-map", "0:v",
-                "-vf", "scale=720:576",
-                "-f", "mjpeg", "-q:v", "5", "-r", "5", "pipe:1"
-            };
-            previewProc->start("ffmpeg", args);
-        }
-
-        if (!previewProc->waitForStarted(5000)) {
-            dvPreviewWanted = false;
-            setStatus("DV preview start error: " + previewProc->errorString());
-            previewProc->deleteLater();
-            previewProc = nullptr;
-            previewBtn->setText("Start Preview");
-            return;
-        }
-
-        previewBtn->setText("Stop Preview");
-        setStatus("DV preview running: " + QFileInfo(resolvedPath).fileName());
+        Q_UNUSED(filePath);
+        dvPreviewWanted = false;
+        if (previewProc) stopPreview();
+        previewBtn->setEnabled(false);
+        previewBtn->setText("Preview Unavailable");
+        previewLabel->clear();
+        previewLabel->setText("DV frame preview unavailable. Use Attach / Monitor and the event log instead.");
+        setStatus("DV frame preview has been removed because segment-based playback was unreliable.");
     }
 
     void togglePreview() {
-        if (previewProc || (isDvMode() && dvPreviewWanted)) {
+        if (isDvMode()) {
             dvPreviewWanted = false;
+            previewBtn->setEnabled(false);
+            previewBtn->setText("Preview Unavailable");
+            previewLabel->clear();
+            previewLabel->setText("DV frame preview unavailable. Use Attach / Monitor and the event log instead.");
+            setStatus("DV frame preview has been removed because segment-based playback was unreliable.");
+            return;
+        }
+
+        if (previewProc) {
             stopPreview();
             previewBtn->setText("Start Preview");
             return;
@@ -962,20 +936,6 @@ private:
                 break;
             case CaptureMode::LocalDvgrab:
             case CaptureMode::RemoteDvgrab:
-                dvPreviewWanted = true;
-                startDvgrabMonitor();
-                if (!lastDvFile.isEmpty()) {
-                    startDvFilePreview(lastDvFile);
-                } else {
-                    const QString fallbackFile = resolveDvPreviewPath(findNewestDvSegment());
-                    if (!fallbackFile.isEmpty()) {
-                        lastDvFile = fallbackFile;
-                        startDvFilePreview(fallbackFile);
-                    } else {
-                        previewBtn->setText("Stop Preview");
-                        setStatus("DV preview armed - waiting for the first captured file.");
-                    }
-                }
                 break;
         }
     }
@@ -1421,9 +1381,6 @@ private:
                     appendDvEvent("New segment: " + fallbackFile);
                     lastDvFile = fallbackFile;
                 }
-                if (dvPreviewWanted && (fileChanged || !previewProc)) {
-                    startDvFilePreview(fallbackFile);
-                }
             }
             return;
         }
@@ -1447,9 +1404,6 @@ private:
             lastDvFile = previewFile;
         }
 
-        if (dvPreviewWanted && (fileChanged || !previewProc)) {
-            startDvFilePreview(previewFile);
-        }
 
         lastDvStatusKey = key;
     }
