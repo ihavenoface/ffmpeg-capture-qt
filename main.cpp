@@ -64,6 +64,12 @@ static QString shellSingleQuote(QString s) {
     return "'" + s + "'";
 }
 
+static QString shellJoin(const QStringList &args) {
+    QStringList out;
+    for (const auto &arg : args) out << shellSingleQuote(arg);
+    return out.join(' ');
+}
+
 static std::optional<qint64> parseDurationSeconds(const QString &s, QString *err = nullptr) {
     const auto parts = s.trimmed().split(':');
     bool ok1 = false, ok2 = false, ok3 = false;
@@ -120,8 +126,6 @@ public:
         inputParams = makeInputParams();
         codecParams = makeCodecParams();
         buildUi();
-        refreshDevices();
-        outLabel->setText(timestampedFilename());
 
         timer = new QTimer(this);
         timer->setInterval(1000);
@@ -131,11 +135,14 @@ public:
         dvMonitorTimer->setInterval(2000);
         connect(dvMonitorTimer, &QTimer::timeout, this, &MainWindow::refreshDvgrabMonitor);
 
-        resize(1280, 760);
-        setWindowTitle("FFmpeg Capture Recorder");
+        refreshLocalDevices();
+        resize(1380, 820);
+        setWindowTitle("Capture Recorder");
+        updateModeUi();
     }
 
     ~MainWindow() override {
+        dvPreviewWanted = false;
         stopPreview();
         stopRecording(true);
         stopDvgrabMonitor();
@@ -146,6 +153,13 @@ public:
     }
 
 private:
+    enum class CaptureMode {
+        LocalFfmpeg = 0,
+        RemoteFfmpeg = 1,
+        LocalDvgrab = 2,
+        RemoteDvgrab = 3
+    };
+
     QList<Param> inputParams;
     QList<Param> codecParams;
 
@@ -164,11 +178,37 @@ private:
     QString lastDvStatusKey;
     QString lastDvFile;
     QStringList recentDvEvents;
+    bool dvPreviewWanted = false;
+
+    QComboBox *modeSelect = nullptr;
+    QStackedWidget *modeStack = nullptr;
 
     QComboBox *videoSelect = nullptr;
     QComboBox *audioSelect = nullptr;
+    QLineEdit *localOutputEdit = nullptr;
+
+    QLineEdit *remoteFfmpegTargetEdit = nullptr;
+    QComboBox *remoteVideoSelect = nullptr;
+    QComboBox *remoteAudioSelect = nullptr;
+    QLineEdit *remoteOutputEdit = nullptr;
+
+    QWidget *dvTargetRow = nullptr;
+    QLineEdit *dvTargetEdit = nullptr;
+    QLineEdit *dvBaseEdit = nullptr;
+    QLineEdit *tapeNameEdit = nullptr;
+    QLabel *dvRemoteInfoLabel = nullptr;
+    QLabel *dvCmdPreview = nullptr;
+    QLabel *dvStatusLabel = nullptr;
+    QLabel *dvLiveLabel = nullptr;
+    QPlainTextEdit *dvEventLogEdit = nullptr;
+    QPlainTextEdit *dvVerboseEdit = nullptr;
+    QCheckBox *dvVerboseCheck = nullptr;
+    QPushButton *dvAttachBtn = nullptr;
+    QPushButton *dvDetachBtn = nullptr;
+    QPushButton *dvShutdownBtn = nullptr;
+    QTimer *dvMonitorTimer = nullptr;
+
     QLineEdit *durEdit = nullptr;
-    QLabel *outLabel = nullptr;
     QLabel *previewLabel = nullptr;
     QLabel *timerLabel = nullptr;
     QProgressBar *progress = nullptr;
@@ -178,42 +218,54 @@ private:
     QPlainTextEdit *logEdit = nullptr;
     QTimer *timer = nullptr;
 
-    QLineEdit *sshTargetEdit = nullptr;
-    QLineEdit *remoteBaseEdit = nullptr;
-    QLineEdit *tapeNameEdit = nullptr;
-    QLabel *dvRemoteInfoLabel = nullptr;
-    QLabel *dvCmdPreview = nullptr;
-    QLabel *dvStatusLabel = nullptr;
-    QLabel *dvLiveLabel = nullptr;
-    QPlainTextEdit *dvEventLogEdit = nullptr;
-    QPlainTextEdit *dvVerboseEdit = nullptr;
-    QCheckBox *dvVerboseCheck = nullptr;
-    QPushButton *dvStartBtn = nullptr;
-    QPushButton *dvStopBtn = nullptr;
-    QPushButton *dvAttachBtn = nullptr;
-    QPushButton *dvDetachBtn = nullptr;
-    QPushButton *dvShutdownBtn = nullptr;
-    QTimer *dvMonitorTimer = nullptr;
+    CaptureMode currentMode() const {
+        return static_cast<CaptureMode>(modeSelect ? modeSelect->currentIndex() : 0);
+    }
+
+    bool isFfmpegMode() const {
+        return currentMode() == CaptureMode::LocalFfmpeg || currentMode() == CaptureMode::RemoteFfmpeg;
+    }
+
+    bool isDvMode() const {
+        return currentMode() == CaptureMode::LocalDvgrab || currentMode() == CaptureMode::RemoteDvgrab;
+    }
+
+    bool isRemoteFfmpegMode() const {
+        return currentMode() == CaptureMode::RemoteFfmpeg;
+    }
+
+    bool isRemoteDvMode() const {
+        return currentMode() == CaptureMode::RemoteDvgrab;
+    }
+
+    QString nextLocalOutputName() const {
+        return timestampedFilename();
+    }
+
+    QString nextRemoteOutputName() const {
+        return "/tmp/" + timestampedFilename();
+    }
 
     void buildUi() {
         auto *tabs = new QTabWidget(this);
-        auto *recorderTab = new QWidget;
-        auto *dvTab = buildDvgrabTab();
+        auto *captureTab = new QWidget;
         auto *advancedTab = buildAdvancedTab();
         auto *logTab = new QWidget;
 
-        tabs->addTab(recorderTab, "Recorder");
-        tabs->addTab(dvTab, "DV Grab");
+        tabs->addTab(captureTab, "Capture");
         tabs->addTab(advancedTab, "Advanced");
-        tabs->addTab(logTab, "FFmpeg Log");
+        tabs->addTab(logTab, "Log");
         setCentralWidget(tabs);
 
-        videoSelect = new QComboBox;
-        audioSelect = new QComboBox;
-        durEdit = new QLineEdit("03:30:00");
-        outLabel = new QLabel;
-        outLabel->setWordWrap(true);
+        modeSelect = new QComboBox;
+        modeSelect->addItems({
+            "Local FFmpeg",
+            "Remote FFmpeg",
+            "Local DVGrab",
+            "Remote DVGrab"
+        });
 
+        durEdit = new QLineEdit("03:30:00");
         connect(durEdit, &QLineEdit::returnPressed, this, [this] {
             QString err;
             auto sec = parseDurationSeconds(durEdit->text(), &err);
@@ -225,71 +277,63 @@ private:
             if (recordProc) setStatus("Target updated -> " + durEdit->text().trimmed());
         });
 
-        auto *refreshBtn = new QPushButton("Refresh Devices");
-        connect(refreshBtn, &QPushButton::clicked, this, &MainWindow::refreshDevices);
+        modeStack = new QStackedWidget;
+        modeStack->addWidget(buildLocalFfmpegPage());
+        modeStack->addWidget(buildRemoteFfmpegPage());
+        modeStack->addWidget(buildDvPage());
 
-        auto *form = new QFormLayout;
-        form->addRow("Video Device", videoSelect);
-        form->addRow("Audio Device", audioSelect);
-        form->addRow("Duration", durEdit);
-        form->addRow("Output File", outLabel);
-
-        previewLabel = new QLabel;
+        previewLabel = new QLabel("Preview");
         previewLabel->setMinimumSize(720, 576);
         previewLabel->setAlignment(Qt::AlignCenter);
         previewLabel->setFrameShape(QFrame::StyledPanel);
-        previewLabel->setText("Preview");
 
         timerLabel = new QLabel;
         timerLabel->setAlignment(Qt::AlignCenter);
         timerLabel->setStyleSheet("font-weight: bold; font-family: monospace; padding: 4px;");
         timerLabel->hide();
 
-        auto *previewBox = new QVBoxLayout;
-        previewBox->addWidget(previewLabel, 1);
-        previewBox->addWidget(timerLabel, 0);
-
-        previewBtn = new QPushButton("Start Preview");
-        recordBtn = new QPushButton("Start Recording");
-
-        connect(previewBtn, &QPushButton::clicked, this, [this] {
-            if (previewProc) stopPreview();
-            else startPreview();
-        });
-        connect(recordBtn, &QPushButton::clicked, this, [this] {
-            if (recordProc) stopRecording(false);
-            else startRecording();
-        });
-
         progress = new QProgressBar;
         progress->setRange(0, 1000);
         progress->setValue(0);
 
-        statusLabel = new QLabel("Ready - select devices and press Start Preview.");
+        statusLabel = new QLabel;
+        statusLabel->setWordWrap(true);
+
+        previewBtn = new QPushButton("Start Preview");
+        recordBtn = new QPushButton("Start Recording");
+        connect(previewBtn, &QPushButton::clicked, this, &MainWindow::togglePreview);
+        connect(recordBtn, &QPushButton::clicked, this, &MainWindow::toggleCapture);
+        connect(modeSelect, &QComboBox::currentIndexChanged, this, [this] { updateModeUi(); });
 
         auto *left = new QWidget;
         auto *leftLayout = new QVBoxLayout(left);
-        leftLayout->addLayout(form);
-        leftLayout->addWidget(refreshBtn);
+
+        auto *topForm = new QFormLayout;
+        topForm->addRow("Mode", modeSelect);
+        topForm->addRow("Duration", durEdit);
+        leftLayout->addLayout(topForm);
+        leftLayout->addWidget(modeStack, 1);
 
         auto *btnRow = new QHBoxLayout;
         btnRow->addWidget(previewBtn);
         btnRow->addWidget(recordBtn);
+        btnRow->addStretch();
         leftLayout->addLayout(btnRow);
         leftLayout->addWidget(progress);
         leftLayout->addWidget(statusLabel);
-        leftLayout->addStretch();
 
         auto *right = new QWidget;
-        right->setLayout(previewBox);
+        auto *rightLayout = new QVBoxLayout(right);
+        rightLayout->addWidget(previewLabel, 1);
+        rightLayout->addWidget(timerLabel);
 
         auto *split = new QSplitter;
         split->addWidget(left);
         split->addWidget(right);
         split->setStretchFactor(1, 1);
 
-        auto *recLayout = new QVBoxLayout(recorderTab);
-        recLayout->addWidget(split);
+        auto *captureLayout = new QVBoxLayout(captureTab);
+        captureLayout->addWidget(split);
 
         logEdit = new QPlainTextEdit;
         logEdit->setReadOnly(true);
@@ -304,13 +348,77 @@ private:
         logLayout->addWidget(logEdit, 1);
     }
 
-    QWidget* buildDvgrabTab() {
-        auto *tab = new QWidget;
+    QWidget *buildLocalFfmpegPage() {
+        auto *page = new QWidget;
+        videoSelect = new QComboBox;
+        audioSelect = new QComboBox;
+        localOutputEdit = new QLineEdit(nextLocalOutputName());
 
-        sshTargetEdit = new QLineEdit("uni@recorder");
-        remoteBaseEdit = new QLineEdit("/mnt/data");
+        auto *refreshBtn = new QPushButton("Refresh Local Devices");
+        connect(refreshBtn, &QPushButton::clicked, this, &MainWindow::refreshLocalDevices);
+
+        auto *form = new QFormLayout(page);
+        form->addRow("Video Device", videoSelect);
+        form->addRow("Audio Device", audioSelect);
+        form->addRow("Output File", localOutputEdit);
+        form->addRow(QString(), refreshBtn);
+        return page;
+    }
+
+    QWidget *buildRemoteFfmpegPage() {
+        auto *page = new QWidget;
+
+        remoteFfmpegTargetEdit = new QLineEdit("uni@recorder");
+        remoteVideoSelect = new QComboBox;
+        remoteAudioSelect = new QComboBox;
+        remoteVideoSelect->setEditable(true);
+        remoteAudioSelect->setEditable(true);
+        remoteOutputEdit = new QLineEdit(nextRemoteOutputName());
+
+        auto *hint = new QLabel(
+            "Assumes FFmpeg is available on the remote host. The device fields are editable so you can "
+            "refresh dshow names or type custom capture inputs when needed."
+        );
+        hint->setWordWrap(true);
+        hint->setStyleSheet("color: palette(mid);");
+
+        auto *refreshBtn = new QPushButton("Refresh Remote Devices");
+        connect(refreshBtn, &QPushButton::clicked, this, &MainWindow::refreshRemoteDevices);
+
+        auto *layout = new QVBoxLayout(page);
+        layout->addWidget(hint);
+
+        auto *form = new QFormLayout;
+        form->addRow("SSH Target", remoteFfmpegTargetEdit);
+        form->addRow("Remote Video Device", remoteVideoSelect);
+        form->addRow("Remote Audio Device", remoteAudioSelect);
+        form->addRow("Remote Output File", remoteOutputEdit);
+        layout->addLayout(form);
+        layout->addWidget(refreshBtn, 0, Qt::AlignLeft);
+        layout->addStretch();
+
+        return page;
+    }
+
+    QWidget *buildDvPage() {
+        auto *page = new QWidget;
+
+        dvTargetEdit = new QLineEdit("uni@recorder");
+        dvBaseEdit = new QLineEdit("/mnt/data");
         tapeNameEdit = new QLineEdit;
         tapeNameEdit->setPlaceholderText("e.g. testing or holiday-2007-01");
+
+        dvTargetRow = new QWidget;
+        auto *targetRowLayout = new QFormLayout(dvTargetRow);
+        targetRowLayout->setContentsMargins(0, 0, 0, 0);
+        targetRowLayout->addRow("SSH Target", dvTargetEdit);
+
+        auto *hint = new QLabel(
+            "DV mode runs dvgrab in a detached byobu/tmux/nohup session. "
+            "Preview is generated from the latest file segment through FFmpeg."
+        );
+        hint->setWordWrap(true);
+        hint->setStyleSheet("color: palette(mid);");
 
         dvRemoteInfoLabel = new QLabel("Destination: -");
         dvRemoteInfoLabel->setWordWrap(true);
@@ -321,26 +429,13 @@ private:
         dvCmdPreview->setFrameShape(QFrame::StyledPanel);
         dvCmdPreview->setMargin(8);
 
-        auto *form = new QFormLayout;
-        form->addRow("SSH Target", sshTargetEdit);
-        form->addRow("Remote Base Path", remoteBaseEdit);
-        form->addRow("Tape Name", tapeNameEdit);
-        form->addRow("Destination", dvRemoteInfoLabel);
-        form->addRow("Detached Command", dvCmdPreview);
-
-        auto *hint = new QLabel(
-            "The recorder launches dvgrab in a detached byobu/tmux session. "
-            "The monitor stays quiet by keeping only the latest live status and logging only important events."
-        );
-        hint->setWordWrap(true);
-        hint->setStyleSheet("color: palette(mid);");
-
-        dvStartBtn = new QPushButton("Start Detached DV Capture");
-        dvStopBtn = new QPushButton("Stop Remote Session");
         dvAttachBtn = new QPushButton("Attach / Monitor");
         dvDetachBtn = new QPushButton("Stop Monitoring");
         dvShutdownBtn = new QPushButton("Shut Down Remote Machine");
-        dvVerboseCheck = new QCheckBox("Show raw monitor tail");
+        dvDetachBtn->setEnabled(false);
+
+        dvStatusLabel = new QLabel("Ready.");
+        dvStatusLabel->setWordWrap(true);
 
         dvLiveLabel = new QLabel("No active DV status yet.");
         dvLiveLabel->setWordWrap(true);
@@ -348,9 +443,6 @@ private:
         dvLiveLabel->setMargin(10);
         dvLiveLabel->setMinimumHeight(120);
         dvLiveLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-
-        dvStatusLabel = new QLabel("Ready - enter a tape name to prepare the detached DV session.");
-        dvStatusLabel->setWordWrap(true);
 
         dvEventLogEdit = new QPlainTextEdit;
         dvEventLogEdit->setReadOnly(true);
@@ -365,9 +457,18 @@ private:
         dvVerboseEdit->setPlaceholderText("Optional raw session tail.");
         dvVerboseEdit->setVisible(false);
 
+        dvVerboseCheck = new QCheckBox("Show raw monitor tail");
+        connect(dvVerboseCheck, &QCheckBox::toggled, this, [this](bool on) {
+            dvVerboseEdit->setVisible(on);
+        });
+
+        auto *form = new QFormLayout;
+        form->addRow("Base Path", dvBaseEdit);
+        form->addRow("Tape Name", tapeNameEdit);
+        form->addRow("Destination", dvRemoteInfoLabel);
+        form->addRow("Detached Command", dvCmdPreview);
+
         auto *buttonRow = new QHBoxLayout;
-        buttonRow->addWidget(dvStartBtn);
-        buttonRow->addWidget(dvStopBtn);
         buttonRow->addWidget(dvAttachBtn);
         buttonRow->addWidget(dvDetachBtn);
         buttonRow->addWidget(dvShutdownBtn);
@@ -386,8 +487,9 @@ private:
         verboseLayout->addWidget(dvVerboseCheck);
         verboseLayout->addWidget(dvVerboseEdit);
 
-        auto *layout = new QVBoxLayout(tab);
+        auto *layout = new QVBoxLayout(page);
         layout->addWidget(hint);
+        layout->addWidget(dvTargetRow);
         layout->addLayout(form);
         layout->addLayout(buttonRow);
         layout->addWidget(dvStatusLabel);
@@ -395,29 +497,20 @@ private:
         layout->addWidget(eventBox, 1);
         layout->addWidget(verboseBox);
 
-        dvStopBtn->setEnabled(false);
-        dvDetachBtn->setEnabled(false);
-
-        connect(sshTargetEdit, &QLineEdit::textChanged, this, &MainWindow::updateDvgrabPreview);
-        connect(remoteBaseEdit, &QLineEdit::textChanged, this, &MainWindow::updateDvgrabPreview);
-        connect(tapeNameEdit, &QLineEdit::textChanged, this, &MainWindow::updateDvgrabPreview);
+        connect(dvTargetEdit, &QLineEdit::textChanged, this, &MainWindow::updateDvUi);
+        connect(dvBaseEdit, &QLineEdit::textChanged, this, &MainWindow::updateDvUi);
+        connect(tapeNameEdit, &QLineEdit::textChanged, this, &MainWindow::updateDvUi);
         connect(tapeNameEdit, &QLineEdit::returnPressed, this, [this] {
-            if (dvStartBtn->isEnabled()) startDvgrab();
+            if (isDvMode() && !dvSessionActive()) startDvgrab();
         });
-        connect(dvStartBtn, &QPushButton::clicked, this, &MainWindow::startDvgrab);
-        connect(dvStopBtn, &QPushButton::clicked, this, &MainWindow::stopDvgrabSession);
         connect(dvAttachBtn, &QPushButton::clicked, this, &MainWindow::startDvgrabMonitor);
         connect(dvDetachBtn, &QPushButton::clicked, this, &MainWindow::stopDvgrabMonitor);
         connect(dvShutdownBtn, &QPushButton::clicked, this, &MainWindow::shutdownRemoteMachine);
-        connect(dvVerboseCheck, &QCheckBox::toggled, this, [this](bool on) {
-            dvVerboseEdit->setVisible(on);
-        });
 
-        updateDvgrabPreview();
-        return tab;
+        return page;
     }
 
-    QWidget* buildAdvancedTab() {
+    QWidget *buildAdvancedTab() {
         auto *root = new QWidget;
         auto *layout = new QVBoxLayout(root);
         layout->addWidget(buildParamSection("Input / Capture Parameters", inputParams));
@@ -450,7 +543,7 @@ private:
         return wrapper;
     }
 
-    QWidget* buildParamSection(const QString &title, QList<Param> &params) {
+    QWidget *buildParamSection(const QString &title, QList<Param> &params) {
         auto *box = new QGroupBox(title);
         auto *form = new QFormLayout(box);
 
@@ -479,13 +572,76 @@ private:
         return out;
     }
 
-    void refreshDevices() {
-        QProcess p;
-        hideChildConsole(p);
-        p.start("ffmpeg", {"-list_devices", "true", "-f", "dshow", "-i", "dummy"});
-        p.waitForFinished(10000);
+    void updateModeUi() {
+        modeStack->setCurrentIndex(isDvMode() ? 2 : (isRemoteFfmpegMode() ? 1 : 0));
 
-        const QString text = QString::fromLocal8Bit(p.readAllStandardError()) + QString::fromLocal8Bit(p.readAllStandardOutput());
+        if (dvTargetRow) dvTargetRow->setVisible(isRemoteDvMode());
+        if (dvShutdownBtn) dvShutdownBtn->setVisible(isRemoteDvMode());
+        updateDvUi();
+
+        if (isFfmpegMode()) {
+            recordBtn->setText(recordProc ? "Stop Recording" : "Start Recording");
+        } else {
+            recordBtn->setText(dvSessionActive() ? "Stop Capture" : "Start Capture");
+        }
+
+        previewBtn->setText((previewProc || (isDvMode() && dvPreviewWanted)) ? "Stop Preview" : "Start Preview");
+
+        if (!recordProc && !previewProc && !dvSessionActive()) {
+            switch (currentMode()) {
+                case CaptureMode::LocalFfmpeg:
+                    setStatus("Ready - select local devices and press Start Preview.");
+                    break;
+                case CaptureMode::RemoteFfmpeg:
+                    setStatus("Ready - enter the SSH target and remote devices, then press Start Preview.");
+                    break;
+                case CaptureMode::LocalDvgrab:
+                    setStatus("Ready - enter the tape name and base path to start DV capture.");
+                    break;
+                case CaptureMode::RemoteDvgrab:
+                    setStatus("Ready - enter the SSH target, tape name and base path to start DV capture.");
+                    break;
+            }
+        }
+    }
+
+    void updateDvUi() {
+        if (!dvRemoteInfoLabel) return;
+
+        const QString tape = sanitizeTapeName(tapeNameEdit->text());
+        const QString base = dvBaseEdit->text().trimmed();
+        const QString target = dvTargetEdit->text().trimmed();
+        const QString session = buildDvSessionName();
+
+        if (tape.isEmpty() || base.isEmpty()) {
+            dvRemoteInfoLabel->setText("Destination: -");
+            dvCmdPreview->setText("Enter a tape name to generate the detached dvgrab command.");
+            dvAttachBtn->setEnabled(false);
+            if (dvShutdownBtn) dvShutdownBtn->setEnabled(isRemoteDvMode() && !target.isEmpty());
+            return;
+        }
+
+        const QString dir = base + "/" + tape;
+        const QString cmd = buildDvLaunchCommand();
+
+        dvRemoteInfoLabel->setText("Destination: " + dir + "    |    Session: " + session);
+        if (isRemoteDvMode()) {
+            dvCmdPreview->setText(target.isEmpty() ? cmd : ("ssh " + target + " " + cmd));
+        } else {
+            dvCmdPreview->setText(cmd);
+        }
+
+        dvAttachBtn->setEnabled(isRemoteDvMode() ? !target.isEmpty() : true);
+        if (dvShutdownBtn) dvShutdownBtn->setEnabled(isRemoteDvMode() && !target.isEmpty());
+    }
+
+    void selectPreferred(QComboBox *box, const QString &preferred) {
+        int idx = box->findText(preferred);
+        if (idx >= 0) box->setCurrentIndex(idx);
+        else if (box->count() > 0) box->setCurrentIndex(0);
+    }
+
+    void populateDeviceCombos(const QString &text, QComboBox *videoBox, QComboBox *audioBox) {
         QRegularExpression re(QStringLiteral("\"([^\"]+)\"\\s+\\((video|audio)\\)"));
         QSet<QString> vids, auds;
 
@@ -497,42 +653,67 @@ private:
             if (m.captured(2) == "audio") auds.insert(m.captured(1));
         }
 
-        videoSelect->clear();
-        audioSelect->clear();
+        const QString prevV = videoBox->isEditable() ? videoBox->currentText() : QString();
+        const QString prevA = audioBox->isEditable() ? audioBox->currentText() : QString();
 
-        if (vids.isEmpty()) videoSelect->addItem("<no video devices found>");
+        videoBox->clear();
+        audioBox->clear();
+
+        if (vids.isEmpty()) videoBox->addItem("<no video devices found>");
         else {
             auto list = vids.values();
             std::sort(list.begin(), list.end());
-            videoSelect->addItems(list);
+            videoBox->addItems(list);
         }
 
-        if (auds.isEmpty()) audioSelect->addItem("<no audio devices found>");
+        if (auds.isEmpty()) audioBox->addItem("<no audio devices found>");
         else {
             auto list = auds.values();
             std::sort(list.begin(), list.end());
-            audioSelect->addItems(list);
+            audioBox->addItems(list);
         }
 
-        selectPreferred(videoSelect, "USB Video");
-        selectPreferred(audioSelect, "Digital Audio Interface (USB Digital Audio)");
-        appendLog("Refreshed FFmpeg dshow devices.");
+        if (videoBox->isEditable() && !prevV.isEmpty()) videoBox->setEditText(prevV);
+        else selectPreferred(videoBox, "USB Video");
+
+        if (audioBox->isEditable() && !prevA.isEmpty()) audioBox->setEditText(prevA);
+        else selectPreferred(audioBox, "Digital Audio Interface (USB Digital Audio)");
     }
 
-    void selectPreferred(QComboBox *box, const QString &preferred) {
-        int idx = box->findText(preferred);
-        if (idx >= 0) box->setCurrentIndex(idx);
-        else if (box->count() > 0) box->setCurrentIndex(0);
+    void refreshLocalDevices() {
+        QProcess p;
+        hideChildConsole(p);
+        p.start("ffmpeg", {"-list_devices", "true", "-f", "dshow", "-i", "dummy"});
+        p.waitForFinished(10000);
+        const QString text = QString::fromLocal8Bit(p.readAllStandardError()) + QString::fromLocal8Bit(p.readAllStandardOutput());
+        populateDeviceCombos(text, videoSelect, audioSelect);
+        appendLog("Refreshed local FFmpeg dshow devices.");
     }
 
-    void startPreview() {
-        stopPreview();
-        const QString vDev = videoSelect->currentText();
-        if (vDev.isEmpty() || vDev.startsWith('<')) {
-            setStatus("No valid video device selected.");
+    void refreshRemoteDevices() {
+        const QString target = remoteFfmpegTargetEdit->text().trimmed();
+        if (target.isEmpty()) {
+            QMessageBox::warning(this, "SSH Target", "Please enter a remote FFmpeg SSH target first.");
             return;
         }
 
+        QProcess p;
+        hideChildConsole(p);
+        p.start("ssh", {target, "ffmpeg -list_devices true -f dshow -i dummy"});
+        p.waitForFinished(15000);
+
+        const QString text = QString::fromLocal8Bit(p.readAllStandardError()) + QString::fromLocal8Bit(p.readAllStandardOutput());
+        populateDeviceCombos(text, remoteVideoSelect, remoteAudioSelect);
+        appendLog("Refreshed remote FFmpeg devices from " + target + ".");
+    }
+
+    QString localVideoDevice() const { return videoSelect->currentText().trimmed(); }
+    QString localAudioDevice() const { return audioSelect->currentText().trimmed(); }
+    QString remoteVideoDevice() const { return remoteVideoSelect->currentText().trimmed(); }
+    QString remoteAudioDevice() const { return remoteAudioSelect->currentText().trimmed(); }
+
+    void preparePreviewProcess() {
+        stopPreview();
         previewProc = new QProcess(this);
         hideChildConsole(*previewProc);
         previewBuffer.clear();
@@ -548,9 +729,26 @@ private:
                 [this](int, QProcess::ExitStatus) {
             previewProc->deleteLater();
             previewProc = nullptr;
-            previewBtn->setText("Start Preview");
-            setStatus("Preview stopped.");
+            if (isDvMode() && dvPreviewWanted) {
+                previewBtn->setText("Stop Preview");
+                setStatus(lastDvFile.isEmpty()
+                              ? "DV preview waiting for the first segment..."
+                              : "DV preview waiting for the next segment...");
+            } else {
+                previewBtn->setText("Start Preview");
+                setStatus("Preview stopped.");
+            }
         });
+    }
+
+    void startLocalPreview() {
+        const QString vDev = localVideoDevice();
+        if (vDev.isEmpty() || vDev.startsWith('<')) {
+            setStatus("No valid local video device selected.");
+            return;
+        }
+
+        preparePreviewProcess();
 
         QStringList args = {"-f", "dshow"};
         args += collectArgs(inputParams, {"-sample_rate"});
@@ -565,7 +763,137 @@ private:
         }
 
         previewBtn->setText("Stop Preview");
-        setStatus("Preview running...");
+        setStatus("Local preview running...");
+    }
+
+    QString buildRemoteFfmpegPreviewCommand() const {
+        const QString vDev = remoteVideoDevice();
+        if (vDev.isEmpty() || vDev.startsWith('<')) return {};
+        QStringList args = {"ffmpeg", "-f", "dshow"};
+        args += collectArgs(inputParams, {"-sample_rate"});
+        args += {"-i", "video=" + vDev, "-vf", "scale=720:576", "-f", "mjpeg", "-q:v", "5", "-r", "10", "pipe:1"};
+        return shellJoin(args);
+    }
+
+    QString buildRemoteFfmpegRecordCommand(const QString &outputFile) const {
+        const QString vDev = remoteVideoDevice();
+        const QString aDev = remoteAudioDevice();
+        if (vDev.isEmpty() || vDev.startsWith('<') || aDev.isEmpty() || aDev.startsWith('<')) return {};
+
+        QStringList args = {"ffmpeg", "-f", "dshow"};
+        args += collectArgs(inputParams);
+        args += {"-i", QString("video=%1:audio=%2").arg(vDev, aDev)};
+        args += {"-map", "0:v", "-map", "0:a"};
+        args += collectArgs(codecParams);
+        args += {outputFile, "-map", "0:v", "-vf", "scale=720:576", "-f", "mjpeg", "-q:v", "5", "-r", "10", "pipe:1"};
+        return shellJoin(args);
+    }
+
+    void startRemoteFfmpegPreview() {
+        const QString target = remoteFfmpegTargetEdit->text().trimmed();
+        const QString cmd = buildRemoteFfmpegPreviewCommand();
+
+        if (target.isEmpty()) {
+            setStatus("Please enter the remote FFmpeg SSH target.");
+            return;
+        }
+        if (cmd.isEmpty()) {
+            setStatus("No valid remote video device selected.");
+            return;
+        }
+
+        preparePreviewProcess();
+        previewProc->start("ssh", {target, cmd});
+
+        if (!previewProc->waitForStarted(5000)) {
+            setStatus("Remote preview start error: " + previewProc->errorString());
+            previewProc->deleteLater();
+            previewProc = nullptr;
+            return;
+        }
+
+        previewBtn->setText("Stop Preview");
+        setStatus("Remote preview running...");
+    }
+
+    void startDvFilePreview(const QString &filePath) {
+        if (filePath.trimmed().isEmpty()) {
+            setStatus("No DV file available for preview yet.");
+            return;
+        }
+
+        preparePreviewProcess();
+
+        if (isRemoteDvMode()) {
+            const QString target = dvTargetEdit->text().trimmed();
+            if (target.isEmpty()) {
+                dvPreviewWanted = false;
+                setStatus("Please enter an SSH target for remote DV preview.");
+                previewProc->deleteLater();
+                previewProc = nullptr;
+                previewBtn->setText("Start Preview");
+                return;
+            }
+
+            QStringList args = {
+                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-re",
+                "-i", filePath,
+                "-map", "0:v",
+                "-vf", "scale=720:576",
+                "-f", "mjpeg", "-q:v", "5", "-r", "5", "pipe:1"
+            };
+            previewProc->start("ssh", {target, shellJoin(args)});
+        } else {
+            QStringList args = {
+                "-hide_banner", "-loglevel", "warning", "-re",
+                "-i", filePath,
+                "-map", "0:v",
+                "-vf", "scale=720:576",
+                "-f", "mjpeg", "-q:v", "5", "-r", "5", "pipe:1"
+            };
+            previewProc->start("ffmpeg", args);
+        }
+
+        if (!previewProc->waitForStarted(5000)) {
+            dvPreviewWanted = false;
+            setStatus("DV preview start error: " + previewProc->errorString());
+            previewProc->deleteLater();
+            previewProc = nullptr;
+            previewBtn->setText("Start Preview");
+            return;
+        }
+
+        previewBtn->setText("Stop Preview");
+        setStatus("DV preview running...");
+    }
+
+    void togglePreview() {
+        if (previewProc || (isDvMode() && dvPreviewWanted)) {
+            dvPreviewWanted = false;
+            stopPreview();
+            previewBtn->setText("Start Preview");
+            return;
+        }
+
+        switch (currentMode()) {
+            case CaptureMode::LocalFfmpeg:
+                startLocalPreview();
+                break;
+            case CaptureMode::RemoteFfmpeg:
+                startRemoteFfmpegPreview();
+                break;
+            case CaptureMode::LocalDvgrab:
+            case CaptureMode::RemoteDvgrab:
+                dvPreviewWanted = true;
+                startDvgrabMonitor();
+                if (!lastDvFile.isEmpty()) {
+                    startDvFilePreview(lastDvFile);
+                } else {
+                    previewBtn->setText("Stop Preview");
+                    setStatus("DV preview armed - waiting for the first captured file.");
+                }
+                break;
+        }
     }
 
     void stopPreview() {
@@ -574,25 +902,7 @@ private:
         previewProc->waitForFinished(3000);
     }
 
-    void startRecording() {
-        QString err;
-        auto sec = parseDurationSeconds(durEdit->text(), &err);
-        if (!sec || *sec <= 0) {
-            QMessageBox::critical(this, "Invalid duration", err);
-            return;
-        }
-
-        targetDurationSec = *sec;
-        currentOutputFile = timestampedFilename();
-        outLabel->setText(currentOutputFile);
-
-        const QString vDev = videoSelect->currentText();
-        const QString aDev = audioSelect->currentText();
-        if (vDev.isEmpty() || vDev.startsWith('<') || aDev.isEmpty() || aDev.startsWith('<')) {
-            QMessageBox::critical(this, "Missing devices", "Please select valid video and audio devices.");
-            return;
-        }
-
+    void prepareRecordProcess() {
         stopPreview();
         previewBtn->setEnabled(false);
 
@@ -617,11 +927,42 @@ private:
             recordProc->deleteLater();
             recordProc = nullptr;
             progress->setValue(1000);
-            statusLabel->setText("Done: " + currentOutputFile);
-            recordBtn->setText("Start Recording");
             previewBtn->setEnabled(true);
-            outLabel->setText(timestampedFilename());
+
+            if (currentMode() == CaptureMode::LocalFfmpeg) {
+                localOutputEdit->setText(nextLocalOutputName());
+            } else if (currentMode() == CaptureMode::RemoteFfmpeg) {
+                remoteOutputEdit->setText(nextRemoteOutputName());
+            }
+
+            recordBtn->setText("Start Recording");
+            statusLabel->setText("Done: " + currentOutputFile);
         });
+    }
+
+    void startLocalRecording() {
+        QString err;
+        auto sec = parseDurationSeconds(durEdit->text(), &err);
+        if (!sec || *sec <= 0) {
+            QMessageBox::critical(this, "Invalid duration", err);
+            return;
+        }
+
+        const QString vDev = localVideoDevice();
+        const QString aDev = localAudioDevice();
+        if (vDev.isEmpty() || vDev.startsWith('<') || aDev.isEmpty() || aDev.startsWith('<')) {
+            QMessageBox::critical(this, "Missing devices", "Please select valid local video and audio devices.");
+            return;
+        }
+
+        targetDurationSec = *sec;
+        currentOutputFile = localOutputEdit->text().trimmed();
+        if (currentOutputFile.isEmpty()) {
+            currentOutputFile = nextLocalOutputName();
+            localOutputEdit->setText(currentOutputFile);
+        }
+
+        prepareRecordProcess();
 
         QStringList args = {"-f", "dshow"};
         args += collectArgs(inputParams);
@@ -646,6 +987,51 @@ private:
         setStatus("Recording...");
     }
 
+    void startRemoteRecording() {
+        QString err;
+        auto sec = parseDurationSeconds(durEdit->text(), &err);
+        if (!sec || *sec <= 0) {
+            QMessageBox::critical(this, "Invalid duration", err);
+            return;
+        }
+
+        const QString target = remoteFfmpegTargetEdit->text().trimmed();
+        if (target.isEmpty()) {
+            QMessageBox::critical(this, "Missing SSH target", "Please enter a remote FFmpeg SSH target.");
+            return;
+        }
+
+        currentOutputFile = remoteOutputEdit->text().trimmed();
+        if (currentOutputFile.isEmpty()) {
+            currentOutputFile = nextRemoteOutputName();
+            remoteOutputEdit->setText(currentOutputFile);
+        }
+
+        const QString cmd = buildRemoteFfmpegRecordCommand(currentOutputFile);
+        if (cmd.isEmpty()) {
+            QMessageBox::critical(this, "Missing devices", "Please select valid remote video and audio devices.");
+            return;
+        }
+
+        targetDurationSec = *sec;
+        prepareRecordProcess();
+
+        recordProc->start("ssh", {target, cmd});
+        if (!recordProc->waitForStarted(5000)) {
+            setStatus("Failed to start remote FFmpeg: " + recordProc->errorString());
+            previewBtn->setEnabled(true);
+            recordProc->deleteLater();
+            recordProc = nullptr;
+            return;
+        }
+
+        recordStart = QDateTime::currentDateTime();
+        timer->start();
+        progress->setValue(0);
+        recordBtn->setText("Stop Recording");
+        setStatus("Remote recording...");
+    }
+
     void stopRecording(bool force) {
         if (!recordProc) return;
         if (!force) {
@@ -656,10 +1042,21 @@ private:
         recordProc->waitForFinished(3000);
         timer->stop();
         timerLabel->hide();
-        recordBtn->setText("Start Recording");
         previewBtn->setEnabled(true);
+        recordBtn->setText("Start Recording");
         setStatus("Recording stopped by user.");
-        outLabel->setText(timestampedFilename());
+    }
+
+    void toggleCapture() {
+        if (isFfmpegMode()) {
+            if (recordProc) stopRecording(false);
+            else if (isRemoteFfmpegMode()) startRemoteRecording();
+            else startLocalRecording();
+            return;
+        }
+
+        if (dvSessionActive()) stopDvgrabSession();
+        else startDvgrab();
     }
 
     QString buildDvSessionName() const {
@@ -673,7 +1070,7 @@ private:
 
     QString buildDvInnerCommand() const {
         const QString tape = sanitizeTapeName(tapeNameEdit->text());
-        const QString base = remoteBaseEdit->text().trimmed();
+        const QString base = dvBaseEdit->text().trimmed();
         if (tape.isEmpty() || base.isEmpty()) return {};
         const QString dir = base + "/" + tape;
         const QString prefix = dir + "/" + tape + "-";
@@ -684,9 +1081,11 @@ private:
         const QString session = buildDvSessionName();
         const QString inner = buildDvInnerCommand();
         if (session.isEmpty() || inner.isEmpty()) return {};
+
         const QString sessionQ = shellSingleQuote(session);
         const QString innerQ = shellSingleQuote(inner);
         const QString logQ = shellSingleQuote("/tmp/" + session + ".log");
+
         return "if command -v byobu >/dev/null 2>&1; then "
                "byobu new-session -d -s " + sessionQ + " -x 220 -y 40 sh -lc " + innerQ +
                "; elif command -v tmux >/dev/null 2>&1; then "
@@ -697,8 +1096,10 @@ private:
     QString buildDvMonitorCommand() const {
         const QString session = activeDvSessionName();
         if (session.isEmpty()) return {};
+
         const QString sessionQ = shellSingleQuote(session);
         const QString logQ = shellSingleQuote("/tmp/" + session + ".log");
+
         return "if command -v byobu >/dev/null 2>&1 && byobu has-session -t " + sessionQ + " 2>/dev/null; then "
                "byobu capture-pane -pJ -S -30 -t " + sessionQ +
                "; elif command -v tmux >/dev/null 2>&1 && tmux has-session -t " + sessionQ + " 2>/dev/null; then "
@@ -710,8 +1111,10 @@ private:
     QString buildDvStopCommand() const {
         const QString session = activeDvSessionName();
         if (session.isEmpty()) return {};
+
         const QString sessionQ = shellSingleQuote(session);
         const QString pattQ = shellSingleQuote("dvgrab -a -t --rewind --showstatus");
+
         return "if command -v byobu >/dev/null 2>&1 && byobu has-session -t " + sessionQ + " 2>/dev/null; then "
                "byobu kill-session -t " + sessionQ +
                "; elif command -v tmux >/dev/null 2>&1 && tmux has-session -t " + sessionQ + " 2>/dev/null; then "
@@ -727,40 +1130,37 @@ private:
         return "nohup sh -lc " + shellSingleQuote(inner) + " >/tmp/remote-poweroff.log 2>&1 < /dev/null &";
     }
 
-    void updateDvgrabPreview() {
-        const QString tape = sanitizeTapeName(tapeNameEdit->text());
-        const QString base = remoteBaseEdit->text().trimmed();
-        const QString target = sshTargetEdit->text().trimmed();
-        const QString session = buildDvSessionName();
+    void startShellProcess(QProcess *proc, bool remote, const QString &target, const QString &cmd) {
+        hideChildConsole(*proc);
+        if (remote) proc->start("ssh", {target, cmd});
+        else proc->start("sh", {"-lc", cmd});
+    }
 
-        if (tape.isEmpty() || base.isEmpty()) {
-            dvRemoteInfoLabel->setText("Destination: -");
-            dvCmdPreview->setText("Enter a tape name to generate the detached dvgrab command.");
-            dvStartBtn->setEnabled(false);
-            dvAttachBtn->setEnabled(false);
-            dvShutdownBtn->setEnabled(!target.isEmpty());
-            return;
-        }
+    void runSyncShell(bool remote, const QString &target, const QString &cmd, int timeoutMs = 10000) {
+        QProcess p;
+        hideChildConsole(p);
+        if (remote) p.start("ssh", {target, cmd});
+        else p.start("sh", {"-lc", cmd});
+        p.waitForFinished(timeoutMs);
+        appendLog(QString::fromLocal8Bit(p.readAllStandardOutput()));
+        appendLog(QString::fromLocal8Bit(p.readAllStandardError()));
+    }
 
-        const QString dir = base + "/" + tape;
-        dvRemoteInfoLabel->setText("Destination: " + dir + "    |    Session: " + session);
-        const QString command = buildDvLaunchCommand();
-        dvCmdPreview->setText(target.isEmpty() ? command : ("ssh " + target + " " + command));
-        dvStartBtn->setEnabled(!target.isEmpty() && dvLaunchProc == nullptr);
-        dvAttachBtn->setEnabled(!target.isEmpty());
-        dvShutdownBtn->setEnabled(!target.isEmpty());
+    bool dvSessionActive() const {
+        return dvLaunchProc || !currentDvSessionName.isEmpty();
     }
 
     void startDvgrab() {
-        const QString target = sshTargetEdit->text().trimmed();
         const QString tape = sanitizeTapeName(tapeNameEdit->text());
         const QString cmd = buildDvLaunchCommand();
-        if (target.isEmpty()) {
-            QMessageBox::warning(this, "SSH Target", "Please enter an SSH target, for example uni@recorder.");
-            return;
-        }
+        const QString target = dvTargetEdit->text().trimmed();
+
         if (tape.isEmpty()) {
             QMessageBox::warning(this, "Tape Name", "Please enter a tape name.");
+            return;
+        }
+        if (isRemoteDvMode() && target.isEmpty()) {
+            QMessageBox::warning(this, "SSH Target", "Please enter an SSH target, for example uni@recorder.");
             return;
         }
         if (cmd.isEmpty() || dvLaunchProc) return;
@@ -772,10 +1172,13 @@ private:
         dvEventLogEdit->clear();
         dvLiveLabel->setText("Waiting for detached session output...");
         appendDvEvent("Starting detached session " + currentDvSessionName + ".");
-        dvStatusLabel->setText("Launching detached DV session on remote recorder...");
+        dvStatusLabel->setText(isRemoteDvMode()
+                                   ? "Launching detached DV session on remote recorder..."
+                                   : "Launching detached DV session locally...");
 
         dvLaunchProc = new QProcess(this);
         hideChildConsole(*dvLaunchProc);
+
         connect(dvLaunchProc, &QProcess::readyReadStandardOutput, this, [this] {
             appendLog(QString::fromLocal8Bit(dvLaunchProc->readAllStandardOutput()));
         });
@@ -787,31 +1190,35 @@ private:
             const bool ok = (status == QProcess::NormalExit && code == 0);
             if (ok) {
                 dvStatusLabel->setText("Detached DV session is running. Live monitor attached.");
-                dvStopBtn->setEnabled(true);
+                recordBtn->setText("Stop Capture");
                 startDvgrabMonitor();
             } else {
                 dvStatusLabel->setText(QString("Failed to launch detached DV session (exit code %1).").arg(code));
                 appendDvEvent("Launch failed.");
-                dvStopBtn->setEnabled(false);
+                currentDvSessionName.clear();
+                recordBtn->setText("Start Capture");
             }
+
             dvLaunchProc->deleteLater();
             dvLaunchProc = nullptr;
-            updateDvgrabPreview();
+            updateModeUi();
         });
 
-        dvLaunchProc->start("ssh", {target, cmd});
+        startShellProcess(dvLaunchProc, isRemoteDvMode(), target, cmd);
+
         if (!dvLaunchProc->waitForStarted(5000)) {
-            dvStatusLabel->setText("Failed to start SSH: " + dvLaunchProc->errorString());
-            appendDvEvent("SSH launch failed.");
+            dvStatusLabel->setText("Failed to start DV launch process: " + dvLaunchProc->errorString());
+            appendDvEvent("Launch start failed.");
             dvLaunchProc->deleteLater();
             dvLaunchProc = nullptr;
-            updateDvgrabPreview();
-            return;
+            currentDvSessionName.clear();
+            updateModeUi();
         }
-        updateDvgrabPreview();
     }
 
     void startDvgrabMonitor() {
+        if (!isDvMode()) return;
+
         if (activeDvSessionName().isEmpty()) {
             currentDvSessionName = buildDvSessionName();
         }
@@ -819,6 +1226,11 @@ private:
             QMessageBox::warning(this, "Session", "Please enter a tape name first.");
             return;
         }
+        if (isRemoteDvMode() && dvTargetEdit->text().trimmed().isEmpty()) {
+            QMessageBox::warning(this, "SSH Target", "Please enter an SSH target first.");
+            return;
+        }
+
         appendDvEvent("Monitoring session " + activeDvSessionName() + ".");
         dvStatusLabel->setText("Monitoring detached DV session...");
         dvMonitorTimer->start();
@@ -878,12 +1290,12 @@ private:
         }
 
         auto status = parseDvStatus(paneText);
-        if (!status) {
-            return;
-        }
+        if (!status) return;
 
         const DvStatus &s = *status;
+        const bool fileChanged = (lastDvFile != s.file);
         const QString key = s.file + "|" + s.timecode + "|" + QString::number(s.frames / 25);
+
         dvLiveLabel->setText(
             "File: " + QFileInfo(s.file).fileName() + "\n"
             "Full Path: " + s.file + "\n"
@@ -893,24 +1305,29 @@ private:
             (s.recordedAt.isEmpty() ? QString() : ("\nRecorded At: " + s.recordedAt))
         );
 
-        if (lastDvFile != s.file) {
+        if (fileChanged) {
             appendDvEvent("New segment: " + s.file);
             lastDvFile = s.file;
         }
-        if (!lastDvStatusKey.isEmpty() && lastDvStatusKey != key && s.timecode != "") {
-            // Keep live status fresh without logging every frame.
+
+        if (dvPreviewWanted && (fileChanged || !previewProc)) {
+            startDvFilePreview(s.file);
         }
+
         lastDvStatusKey = key;
     }
 
     void refreshDvgrabMonitor() {
-        if (dvMonitorProc) return;
-        const QString target = sshTargetEdit->text().trimmed();
+        if (!isDvMode() || dvMonitorProc) return;
+
         const QString cmd = buildDvMonitorCommand();
-        if (target.isEmpty() || cmd.isEmpty()) return;
+        const QString target = dvTargetEdit->text().trimmed();
+        if (cmd.isEmpty()) return;
+        if (isRemoteDvMode() && target.isEmpty()) return;
 
         dvMonitorProc = new QProcess(this);
         hideChildConsole(*dvMonitorProc);
+
         connect(dvMonitorProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
                 [this](int code, QProcess::ExitStatus status) {
             QString out = QString::fromLocal8Bit(dvMonitorProc->readAllStandardOutput());
@@ -919,21 +1336,24 @@ private:
                 if (!out.isEmpty() && !out.endsWith(QChar('\n'))) out += QChar('\n');
                 out += err;
             }
+
             if (status == QProcess::NormalExit && code == 0) {
                 updateDvMonitorUi(out);
             } else {
                 if (dvMonitorTimer->isActive()) dvMonitorTimer->stop();
-                dvStatusLabel->setText("DV monitor lost the remote session.");
+                dvStatusLabel->setText("DV monitor lost the session.");
                 appendDvEvent("Monitor lost session.");
             }
+
             dvMonitorProc->deleteLater();
             dvMonitorProc = nullptr;
         });
 
-        dvMonitorProc->start("ssh", {target, cmd});
+        startShellProcess(dvMonitorProc, isRemoteDvMode(), target, cmd);
+
         if (!dvMonitorProc->waitForStarted(5000)) {
-            dvStatusLabel->setText("Failed to start monitor SSH: " + dvMonitorProc->errorString());
-            appendDvEvent("Monitor SSH start failed.");
+            dvStatusLabel->setText("Failed to start DV monitor: " + dvMonitorProc->errorString());
+            appendDvEvent("Monitor start failed.");
             dvMonitorProc->deleteLater();
             dvMonitorProc = nullptr;
         }
@@ -951,28 +1371,32 @@ private:
     }
 
     void stopDvgrabSession() {
-        const QString target = sshTargetEdit->text().trimmed();
         const QString cmd = buildDvStopCommand();
-        if (target.isEmpty() || cmd.isEmpty()) return;
+        const QString target = dvTargetEdit->text().trimmed();
+        if (cmd.isEmpty()) return;
+        if (isRemoteDvMode() && target.isEmpty()) return;
 
         stopDvgrabMonitor();
+        dvPreviewWanted = false;
+        stopPreview();
+
         appendDvEvent("Stopping session " + activeDvSessionName() + ".");
-        QProcess p;
-        hideChildConsole(p);
-        p.start("ssh", {target, cmd});
-        p.waitForFinished(10000);
-        appendLog(QString::fromLocal8Bit(p.readAllStandardOutput()));
-        appendLog(QString::fromLocal8Bit(p.readAllStandardError()));
+        runSyncShell(isRemoteDvMode(), target, cmd);
+
         dvStatusLabel->setText("Detached DV session stop requested.");
         dvLiveLabel->setText("Session stopped.");
-        dvStopBtn->setEnabled(false);
         currentDvSessionName.clear();
         lastDvStatusKey.clear();
-        updateDvgrabPreview();
+        lastDvFile.clear();
+        recordBtn->setText("Start Capture");
+        previewBtn->setText("Start Preview");
+        updateModeUi();
     }
 
     void shutdownRemoteMachine() {
-        const QString target = sshTargetEdit->text().trimmed();
+        if (!isRemoteDvMode()) return;
+
+        const QString target = dvTargetEdit->text().trimmed();
         if (target.isEmpty()) {
             QMessageBox::warning(this, "SSH Target", "Please enter an SSH target first.");
             return;
@@ -989,18 +1413,14 @@ private:
 
         stopDvgrabMonitor();
         appendDvEvent("Remote shutdown requested.");
+        runSyncShell(true, target, buildDvShutdownCommand());
 
-        QProcess p;
-        hideChildConsole(p);
-        p.start("ssh", {target, buildDvShutdownCommand()});
-        p.waitForFinished(10000);
-        appendLog(QString::fromLocal8Bit(p.readAllStandardOutput()));
-        appendLog(QString::fromLocal8Bit(p.readAllStandardError()));
         dvStatusLabel->setText("Remote shutdown command sent.");
         dvLiveLabel->setText("Remote machine is shutting down.");
-        dvStopBtn->setEnabled(false);
         currentDvSessionName.clear();
-        updateDvgrabPreview();
+        lastDvFile.clear();
+        recordBtn->setText("Start Capture");
+        updateModeUi();
     }
 
     void onTimerTick() {
@@ -1032,11 +1452,13 @@ private:
                 buf.clear();
                 return;
             }
+
             int end = buf.indexOf(eoi, start + 2);
             if (end < 0) {
                 if (start > 0) buf.remove(0, start);
                 return;
             }
+
             end += 2;
             QByteArray frame = buf.mid(start, end - start);
             buf.remove(0, end);
@@ -1058,6 +1480,7 @@ private:
             const bool isProgressLine = progressRe.match(line).hasMatch();
 
             if (!isProgressLine) appendLog(line);
+
             if (isProgressLine) {
                 auto m = timeRe.match(line);
                 if (m.hasMatch()) {
@@ -1089,13 +1512,14 @@ private:
     }
 
     void appendLog(const QString &s) {
-        logEdit->appendPlainText(s);
+        if (!logEdit) return;
+        if (!s.isEmpty()) logEdit->appendPlainText(s);
         auto *bar = logEdit->verticalScrollBar();
         bar->setValue(bar->maximum());
     }
 
     void setStatus(const QString &s) {
-        statusLabel->setText(s);
+        if (statusLabel) statusLabel->setText(s);
     }
 
     void hideChildConsole(QProcess &proc) {
